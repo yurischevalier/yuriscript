@@ -1,7 +1,3 @@
--- Sari-Sari Store Auto Farm v2.2 | Rayfield | Plot-scoped
--- Set getgenv().SSAF_DEBUG = true BEFORE running to see decisions in the console.
-if getgenv().SSAF_STOP then pcall(getgenv().SSAF_STOP) end
-
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -26,7 +22,6 @@ for _, p in pairs(DC.PRODUCTS) do
     name2id[(p.name:lower():gsub("[^%w]", ""))] = p.id
 end
 
----------------------------------------------------------------- helpers
 local plotCache
 local function myPlot()
     if plotCache and plotCache.Parent and plotCache:GetAttribute("OwnerUserId") == lp.UserId then return plotCache end
@@ -40,7 +35,6 @@ local function myHRP()
     return ch and ch:FindFirstChild("HumanoidRootPart")
 end
 
--- same rule as the game's sectionInactive(): Hidden up the tree, Locked, or RemodelHidden parts
 local function inactive(plot, m)
     local x = m
     while x and x ~= plot do
@@ -96,7 +90,6 @@ local function getRows(c)
     return rows
 end
 
--- nearest customer to the register that actually has an item order (skips queue + load customers)
 local function orderCustomer(plot)
     local reg = plot:FindFirstChild("CashRegister")
     if not reg then return end
@@ -121,7 +114,6 @@ local function pressRegister(plot)
     if reg then R.RegisterPress:FireServer(reg) end
 end
 
----------------------------------------------------------------- hide the game's popups
 local function gameConns(remote, scriptName)
     local out = {}
     local ok, list = pcall(getconnections, remote.OnClientEvent)
@@ -155,9 +147,6 @@ for gui, flag in pairs({KashGGui="KashG", UtangGui="Utang", CashierGui="Checkout
     end
 end
 
----------------------------------------------------------------- grab + register loop
--- IMPORTANT: the server only accepts picks from the shelf's real PickPrompt now.
--- The old ShelfActivate(shelf, "pick") remote is ignored, so we fire the prompt.
 local function pickShelf(shelf)
     local pr = shelf:FindFirstChild("PickPrompt", true)
     if pr then
@@ -199,7 +188,7 @@ local function step()
                     end
                 end
             else
-                missing = true   -- out of stock / unknown product
+                missing = true   
             end
         end
     end
@@ -222,7 +211,6 @@ bind(R.OrderStatus.OnClientEvent, function(d)
     end
 end)
 
----------------------------------------------------------------- exact change (no UI)
 bind(R.CheckoutData.OnClientEvent, function(d)
     if S.Checkout and typeof(d) == "table" and typeof(d.change) == "number" then
         stats.change = stats.change + d.change
@@ -234,7 +222,6 @@ bind(R.CheckoutResult.OnClientEvent, function(ok)
     if ok then stats.served = stats.served + 1 end
 end)
 
----------------------------------------------------------------- KashG
 bind(R.KashGAsk.OnClientEvent, function(d)
     if not S.KashG or typeof(d) ~= "table" then return end
     local img = digits(d.image)
@@ -246,7 +233,6 @@ bind(R.KashGAsk.OnClientEvent, function(d)
     if g and S.HideUI then task.defer(function() g.Enabled = false end) end
 end)
 
----------------------------------------------------------------- Utang
 bind(R.UtangAsk.OnClientEvent, function(d)
     if S.Utang and typeof(d) == "table" then
         R.UtangDecide:FireServer(true)
@@ -254,7 +240,6 @@ bind(R.UtangAsk.OnClientEvent, function(d)
     end
 end)
 
----------------------------------------------------------------- E-Load
 local loadBusy = false
 bind(R.PhoneLoadResult.OnClientEvent, function(ok, msg)
     loadBusy = false
@@ -283,7 +268,6 @@ task.spawn(function()
     end
 end)
 
----------------------------------------------------------------- chores: restock + clean
 local fail = {}
 local function failed(k) return fail[k] and tick() - fail[k] < 10 end
 
@@ -315,8 +299,6 @@ local function collectBoxes()
     return out
 end
 
--- Mirrors the game's boxActionFor: category must match, shelf must be empty or hold the same product,
--- and at most 2 shelves per product (1 for rice).
 local function targetShelf(plot, box, pid, hrp)
     local prod = DC.getProduct(pid)
     local cat = box:GetAttribute("ShelfCategory") or (prod and prod.category) or "general"
@@ -490,7 +472,6 @@ task.spawn(function()
     end
 end)
 
----------------------------------------------------------------- UI
 local Win = Rayfield:CreateWindow({Name="Sari-Sari Auto v2.2", LoadingTitle="Sari-Sari Auto v2.2", ConfigurationSaving={Enabled=false}})
 local T = Win:CreateTab("Main")
 local function tog(name, key)
