@@ -1,4 +1,4 @@
--- Sari-Sari Store Auto Farm v2.3 | Rayfield | Plot-scoped
+-- Sari-Sari Store Auto Farm v2.4 | Rayfield | Plot-scoped
 -- Set getgenv().SSAF_DEBUG = true BEFORE running to see decisions in the console.
 if getgenv().SSAF_STOP then pcall(getgenv().SSAF_STOP) end
 
@@ -10,12 +10,12 @@ local R = RS.SariSariStore.Remotes
 local DC = require(RS.SariSariStore.Modules.DataConfig)
 
 local S = {Grab=true, Checkout=true, KashG=true, Utang=true, Load=true, Clean=true, Restock=true,
-    Pickup=true, Trash=true, Bill=true, Continue=true, Tasks=true, Buy=true,
+    Pickup=true, Trash=true, Bill=true, Continue=true, Tasks=true, Buy=true, Slap=true, AntiAFK=true, Unstick=true,
     HideUI=true, SkipOut=true, Delay=0.05, Pct=100, Reserve=1000}
 local alive = true
 local conns = {}
 local stats = {served=0, change=0, kashOk=0, kashNo=0, loads=0, loadFail=0, utang=0, cleaned=0, restocked=0, picks=0,
-    picked=0, trashed=0, claimed=0, bought=0, bills=0, continued=0}
+    picked=0, trashed=0, claimed=0, bought=0, bills=0, continued=0, slapped=0, afk=0}
 
 local function dbg(...) if getgenv().SSAF_DEBUG then print("[SSAF]", ...) end end
 local function bind(sig, fn) conns[#conns+1] = sig:Connect(fn) end
@@ -122,7 +122,7 @@ local function orderCustomer(plot)
     return best, brows, bd
 end
 
-local lastPress, pressBackoff = 0, 0
+local lastPress, pressBackoff, pickLockUntil = 0, 0, 0
 local function pressRegister(plot)
     if tick() < pressBackoff or tick() - lastPress < 0.4 then return end
     lastPress = tick()
@@ -132,8 +132,11 @@ end
 
 -- the game tells us when nobody is at the counter: back off instead of spamming
 bind(R.ShowWarning.OnClientEvent, function(msg)
-    if typeof(msg) == "string" and msg:find("No customer at the register", 1, true) then
+    if typeof(msg) ~= "string" then return end
+    if msg:find("No customer at the register", 1, true) then
         pressBackoff = tick() + 1.5
+    elseif msg:find("No customer is asking for this", 1, true) then
+        pickLockUntil = tick() + 0.8   -- the order was already complete; stop picking for a moment
     end
 end)
 
@@ -197,7 +200,7 @@ local function step()
             if shelf then
                 needsGrab = true
                 grabBusyUntil = tick() + 1.5
-                if S.Grab then
+                if S.Grab and tick() >= pickLockUntil then
                     local key = c.Name .. "|" .. r.id
                     local p = pend[key]
                     if p and p.have ~= r.have then p = nil pend[key] = nil end
@@ -234,6 +237,7 @@ end)
 bind(R.OrderStatus.OnClientEvent, function(d)
     if typeof(d) == "table" and d.fulfilled == true then
         table.clear(pend)
+        pickLockUntil = tick() + 0.7
         if S.Checkout then pressRegister(myPlot()) end
     end
 end)
@@ -395,6 +399,21 @@ local function standAt(hrp, pos)
     hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
 end
 
+-- after any teleport: clear momentum and make sure the character can walk again
+local baseWalk = 16
+pcall(function() baseWalk = lp.Character:FindFirstChildOfClass("Humanoid").WalkSpeed end)
+local function settle()
+    local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+    local hrp = myHRP()
+    if hrp then hrp.AssemblyLinearVelocity = Vector3.zero end
+    if hum then
+        hum.PlatformStand = false
+        hum.Sit = false
+        if hum:GetState() == Enum.HumanoidStateType.Climbing then hum:ChangeState(Enum.HumanoidStateType.Freefall) end
+        if hum.WalkSpeed <= 0 then hum.WalkSpeed = baseWalk end
+    end
+end
+
 ---------------------------------------------------------------- pickup of shop deliveries
 -- Deliveries show up in TruckBay for only a couple of seconds and the prompt reaches 14 studs,
 -- so we catch it the moment it spawns, hop over, grab it and hop back.
@@ -443,6 +462,7 @@ local function pickupPass()
         pickups[d] = nil
     end
     hrp.CFrame = home
+    settle()
     return did
 end
 
@@ -494,7 +514,7 @@ local function trashPass(plot)
             break
         end
     end
-    if moved then hrp.CFrame = home end
+    if moved then hrp.CFrame = home settle() end
     return did
 end
 
@@ -593,7 +613,7 @@ local function restockPass(plot)
             end
         end
     end
-    if moved then hrp.CFrame = home end
+    if moved then hrp.CFrame = home settle() end
     return did
 end
 
@@ -612,9 +632,9 @@ end
 
 local function holdPrompt(pr)
     if pr.HoldDuration > 0 then
-        pr:InputHoldBegin()
+        pcall(function() pr:InputHoldBegin() end)
         task.wait(pr.HoldDuration + 0.35)
-        pr:InputHoldEnd()
+        pcall(function() pr:InputHoldEnd() end)
     else
         fireproximityprompt(pr)
     end
@@ -670,8 +690,90 @@ local function cleanPass(plot)
         end
     end
     hrp.CFrame = home
+    settle()
     return true
 end
+
+---------------------------------------------------------------- wake up sleeping workers with the Tsinelas
+local CS = game:GetService("CollectionService")
+local slapT = {}
+local function slapPass()
+    local asleep = {}
+    for _, w in ipairs(CS:GetTagged("SariWorkerNPC")) do
+        if w:GetAttribute("SariWorkerOwner") == lp.UserId and w:GetAttribute("Asleep") == true
+            and not (slapT[w] and tick() - slapT[w] < 4) and w:FindFirstChild("HumanoidRootPart") then
+            asleep[#asleep+1] = w
+        end
+    end
+    if #asleep == 0 then return false end
+    local tool = getTool("Tsinelas")
+    local hrp = myHRP()
+    if not tool or not hrp then return false end
+    local home, did = hrp.CFrame, false
+    if not equip(tool) then return false end
+    for _, w in ipairs(asleep) do
+        slapT[w] = tick()
+        local wr = w:FindFirstChild("HumanoidRootPart")
+        if wr and (hrp.Position - wr.Position).Magnitude > 8 then
+            hrp.CFrame = wr.CFrame * CFrame.new(0, 0, 3)
+            task.wait(0.25)
+        end
+        for _ = 1, 2 do
+            R.HitNPC:FireServer(w)
+            local t = tick()
+            while w:GetAttribute("Asleep") == true and tick() - t < 1.2 do task.wait(0.05) end
+            if w:GetAttribute("Asleep") ~= true then break end
+            pcall(function() tool:Activate() end)
+        end
+        if w:GetAttribute("Asleep") ~= true then
+            stats.slapped = stats.slapped + 1
+            did = true
+            dbg("Woke up", w.Name)
+        end
+    end
+    hrp.CFrame = home
+    settle()
+    local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+    if hum then hum:UnequipTools() end
+    return did
+end
+
+---------------------------------------------------------------- anti-AFK + unstick
+local VU = game:GetService("VirtualUser")
+local idleOff = {}
+for _, c in ipairs(getconnections(lp.Idled)) do
+    pcall(function() c:Disable() idleOff[#idleOff+1] = c end)
+end
+local function antiAfk()
+    pcall(function()
+        VU:CaptureController()
+        VU:ClickButton2(Vector2.new(0, 0))
+    end)
+    stats.afk = stats.afk + 1
+end
+bind(lp.Idled, function() if S.AntiAFK then antiAfk() end end)
+
+task.spawn(function()
+    local climbSince, n = nil, 0
+    while alive do
+        task.wait(1)
+        n = n + 1
+        if S.AntiAFK and n % 50 == 0 then antiAfk() end   -- keep-alive well inside Roblox's 20 minute idle limit
+        local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+        if S.Unstick and hum then
+            if hum:GetState() == Enum.HumanoidStateType.Climbing then
+                climbSince = climbSince or tick()
+                if tick() - climbSince > 3 then
+                    hum:ChangeState(Enum.HumanoidStateType.Freefall)
+                    climbSince = nil
+                    dbg("Unstuck from Climbing")
+                end
+            else
+                climbSince = nil
+            end
+        end
+    end
+end)
 
 ---------------------------------------------------------------- scheduler (one thing moves you at a time)
 local nextChore = 0
@@ -685,6 +787,7 @@ task.spawn(function()
                 trackPickups(plot)
                 if hasPickup() then pickupPass() return end
             end
+            if S.Slap and tick() >= grabBusyUntil - 1.2 then slapPass() end
             if tick() < grabBusyUntil or tick() < nextChore then return end   -- stay at the counter while grabbing
             nextChore = tick() + 1
             local did = false
@@ -757,6 +860,15 @@ local function smartBuy()
     end
     if #items == 0 then nextBuyAt = tick() + 10 return end
     local success, msg = placeOrder(items)
+    local soldName = (not success) and tostring(msg):match("^(.-) is sold out")
+    if soldName then
+        -- the market is out of this product for now: skip it and re-plan the order without it
+        local sid = name2id[(soldName:lower():gsub("[^%w]", ""))]
+        if sid then buyFail[sid] = tick() end
+        nextBuyAt = tick() + 1
+        dbg("Sold out in the market:", soldName)
+        return
+    end
     if not success and not tostring(msg):find("on its way", 1, true) then
         -- something in the order was refused (licence / market limit): try the items one at a time
         for _, item in ipairs(items) do
@@ -789,7 +901,7 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------- UI
-local Win = Rayfield:CreateWindow({Name="Sari-Sari Auto v2.3", LoadingTitle="Sari-Sari Auto v2.3", ConfigurationSaving={Enabled=false}})
+local Win = Rayfield:CreateWindow({Name="Sari-Sari Auto v2.4", LoadingTitle="Sari-Sari Auto v2.4", ConfigurationSaving={Enabled=false}})
 local T = Win:CreateTab("Main")
 local function tog(name, key)
     T:CreateToggle({Name=name, CurrentValue=S[key], Callback=function(v) S[key]=v applyUI() end})
@@ -807,6 +919,9 @@ tog("Smart Buy (shop restock)", "Buy")
 tog("Auto Pay Electric Bill", "Bill")
 tog("Auto Continue (day summary)", "Continue")
 tog("Auto Claim Daily Tasks", "Tasks")
+tog("Auto Wake Sleeping Workers (Tsinelas)", "Slap")
+tog("Anti-AFK", "AntiAFK")
+tog("Auto Unstick (Climbing freeze)", "Unstick")
 tog("Hide game popups (register / KashG / Utang)", "HideUI")
 tog("Checkout even if an item is out of stock", "SkipOut")
 T:CreateSlider({Name="Keep this much cash when buying (P)", Range={0,10000}, Increment=250, CurrentValue=S.Reserve, Callback=function(v) S.Reserve=v end})
@@ -820,8 +935,8 @@ task.spawn(function()
         pcall(function()
             lbl1:Set(string.format("Served %d | Picks %d | Change P%d | KashG +%d/-%d | Load %d (fail %d) | Utang %d",
                 stats.served, stats.picks, stats.change, stats.kashOk, stats.kashNo, stats.loads, stats.loadFail, stats.utang))
-            lbl2:Set(string.format("Restocked %d | Bought %d | Picked up %d | Trashed %d | Cleaned %d | Tasks %d | Bills %d | Days %d",
-                stats.restocked, stats.bought, stats.picked, stats.trashed, stats.cleaned, stats.claimed, stats.bills, stats.continued))
+            lbl2:Set(string.format("Restocked %d | Bought %d | Picked up %d | Trashed %d | Cleaned %d | Tasks %d | Bills %d | Days %d | Woke %d | AFK %d",
+                stats.restocked, stats.bought, stats.picked, stats.trashed, stats.cleaned, stats.claimed, stats.bills, stats.continued, stats.slapped, stats.afk))
         end)
         task.wait(1)
     end
@@ -835,5 +950,6 @@ getgenv().SSAF_STOP = function()
     suppress(R.KashGAsk, "KashGClient", false)
     suppress(R.CheckoutData, "RegisterClient", false)
     suppress(R.UtangAsk, "UtangClient", false)
+    for _, c in ipairs(idleOff) do pcall(function() c:Enable() end) end
     pcall(function() Rayfield:Destroy() end)
 end
