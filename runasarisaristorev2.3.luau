@@ -15,15 +15,15 @@ local DC = require(RS.SariSariStore.Modules.DataConfig)
 
 local S = {Grab=true, Checkout=true, KashG=true, Utang=true, Load=true, Clean=true, Restock=true,
     Pickup=true, Trash=true, Bill=true, Continue=true, Tasks=true, Buy=true, Slap=true, AntiAFK=true, Unstick=true,
-    HideUI=true, SkipOut=true, Stay=true, Racks=true, AutoOpen=true, Thief=true, Beggar=true, BeggarAmt=20, BuyBelow=60, Buffer=1, StandTop=false, NeedsFirst=true,
-    BuyMode="Smart", Delay=0.05, Pct=100, Reserve=1000,
-    WaitStock=8, MaxItems=12, MaxBoxes=5, BuyPct=60, Reach=25, HomeRadius=12, RackPct=60, ShopReach=30}
+    HideUI=true, SkipOut=true, Stay=true, Racks=true, AutoOpen=true, Thief=true, Beggar=true, BeggarAmt=20, BuyBelow=60, Buffer=1, TripEvery=6, StandTop=false, NeedsFirst=true,
+    BuyMode="Smart", Delay=0.03, Pct=100, Reserve=1000,
+    WaitStock=8, MaxItems=12, MaxBoxes=5, BuyPct=60, Reach=32, HomeRadius=12, RackPct=60, ShopReach=30}
 local alive = true
 local conns = {}
 local stats = {served=0, change=0, kashOk=0, kashNo=0, loads=0, loadFail=0, utang=0, cleaned=0, restocked=0, picks=0,
     picked=0, trashed=0, claimed=0, bought=0, bills=0, continued=0, slapped=0, afk=0, hops=0, homes=0, racked=0,
     opened=0, caught=0, donated=0}
-local X = {thiefNext=0, lastOpen=0, lastToggle=0, pickupBackoff=0, pickupAdded=0}
+local X = {thiefNext=0, lastOpen=0, lastToggle=0, pickupBackoff=0, pickupAdded=0, nextTrip=0, ban={}, why={}}
 
 local nextBuyAt, nextChore, serveUntil = 0, 0, 0
 local moveBusy = false
@@ -235,6 +235,10 @@ local tpLog, lastTp = {}, 0
 local function tp(cf)
     local hrp = myHRP()
     if not hrp then return false end
+    do
+        local k = tostring(debug.info(2, "n")) .. ">" .. tostring(debug.info(3, "n"))
+        X.why[k] = (X.why[k] or 0) + 1
+    end
     local now = tick()
     while #tpLog > 0 and now - tpLog[1] > 3 do table.remove(tpLog, 1) end
     if #tpLog >= 10 then
@@ -562,7 +566,7 @@ local function step()
                 local key = c.Name .. "|" .. tostring(r.id)
                 local p = pend[key]
                 if p and p.have ~= r.have then p = nil pend[key] = nil end
-                local waiting = p and tick() - p.t < 0.9
+                local waiting = p and tick() - p.t < 0.5
                 if not waiting then
                     local tries = p and (p.tries + 1) or 0
                     if tries >= 4 then
@@ -577,12 +581,12 @@ local function step()
                             pickShelf(shelf, tries >= 2)
                             stats.picks = stats.picks + 1
                             fired = true
-                            task.wait(math.max(S.Delay, 0.06))
+                            task.wait(math.max(S.Delay, 0.02))
                         end
                     end
                 end
             end
-            if fired then settleUntil = tick() + 0.4 end
+            if fired then settleUntil = tick() + 0.12 end
         end
 
         local hold = false
@@ -619,7 +623,7 @@ bind(R.OrderStatus.OnClientEvent, function(d)
     if typeof(d) == "table" and d.fulfilled == true then
         table.clear(pend)
         table.clear(holdMiss)
-        pickLockUntil = tick() + 0.7
+        pickLockUntil = tick() + 0.3
         if S.Checkout then
             task.spawn(function()
                 local plot = myPlot()
@@ -1033,10 +1037,12 @@ local function restockPass(plot)
     local did = rackPass(plot)
     local boxes = collectBoxes()
     if #boxes == 0 then return did end
-    local rank = {}
+    local rank, urgentIds = {}, {}
+    local trip, hopped = tick() >= X.nextTrip, false
     for _, b in ipairs(boxes) do
         local pid = b:GetAttribute("ProductId")
         local r = urgency(plot, pid)
+        if r <= 0.15 or demandNow[pid] or (wanted[pid] and tick() - wanted[pid] < 30) then urgentIds[pid] = true end
         if demandNow[pid] then r = r - 3 end
         if wanted[pid] and tick() - wanted[pid] < 30 then r = r - 2 end
         rank[b] = r
@@ -1066,6 +1072,14 @@ local function restockPass(plot)
                 fail[shelf] = tick() + 20
                 dbg("No RestockPrompt on", shelf.Name)
                 continue
+            end
+            do
+                local pp0, hh0 = promptPos(pr), myHRP()
+                local rch = math.max(4, math.min((pr.MaxActivationDistance or 10) - 6, S.Reach))
+                if pp0 and hh0 and (hh0.Position - pp0).Magnitude > rch then
+                    if not (trip or urgentIds[pid]) then break end
+                    hopped = true
+                end
             end
             nearPrompt(pr)
             do
@@ -1104,6 +1118,7 @@ local function restockPass(plot)
             end
         end
     end
+    if hopped then X.nextTrip = tick() + S.TripEvery end
     return did
 end
 
@@ -1238,7 +1253,8 @@ local function isThief(m, regPos)
     if regPos and (root.Position - regPos).Magnitude > 160 then return false end
     local owner = m:GetAttribute("SukiOwnerId")
     if owner ~= nil and owner ~= lp.UserId then return false end
-    return m:GetAttribute("SariShoplifter") == true or m:GetAttribute("SariCrook") == true or CS:HasTag(m, "SlapThief")
+    if X.ban[m] and tick() < X.ban[m] then return false end
+    return m:GetAttribute("SariShoplifter") == true or CS:HasTag(m, "SlapThief")
 end
 
 local function thiefList()
@@ -1268,12 +1284,13 @@ local function thiefPass()
     local tool = getTool(HIT_TOOL)
     if not tool then dbg("No Tsinelas for the thief") return false end
     if not equip(tool) then return false end
-    local t0, hit = tick(), false
+    local t0, hit, lastTh = tick(), false, nil
     while alive and tick() - t0 < 16 do
         if S.Pickup and hasPickup() then break end
         list = thiefList()
         if #list == 0 then break end
         local th = list[1]
+        lastTh = th
         local tr = th:FindFirstChild("HumanoidRootPart")
         local hrp = myHRP()
         if not (tr and hrp) then break end
@@ -1291,6 +1308,7 @@ local function thiefPass()
         hit = true
         task.wait(0.3)
     end
+    if lastTh and tick() - t0 >= 15 then X.ban[lastTh] = tick() + 30 dbg("gave up chasing a thief") end
     if hit and #thiefList() == 0 then
         stats.caught = stats.caught + 1
         dbg("Thief down")
@@ -1708,7 +1726,7 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------- UI
-local Win = Rayfield:CreateWindow({Name="Sari-Sari Auto v3.3", LoadingTitle="Sari-Sari Auto v3.1", ConfigurationSaving={Enabled=false}})
+local Win = Rayfield:CreateWindow({Name="Sari-Sari Auto v3.4", LoadingTitle="Sari-Sari Auto v3.1", ConfigurationSaving={Enabled=false}})
 local T = Win:CreateTab("Main")
 local function tog(name, key)
     T:CreateToggle({Name=name, CurrentValue=S[key], Callback=function(v) S[key]=v applyUI() end})
@@ -1759,6 +1777,7 @@ T:CreateSlider({Name="Max different items per order", Range={1,12}, Increment=1,
 T:CreateSlider({Name="Max boxes per item", Range={1,10}, Increment=1, CurrentValue=S.MaxBoxes, Callback=function(v) S.MaxBoxes=v end})
 T:CreateSlider({Name="Refill shelf when below (%)", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.Pct, Callback=function(v) S.Pct=v end})
 T:CreateSlider({Name="Fetch rack boxes when shelf below (%)", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.RackPct, Callback=function(v) S.RackPct=v end})
+T:CreateSlider({Name="Far-shelf restock trip every (seconds)", Range={1,30}, Increment=1, CurrentValue=S.TripEvery, Callback=function(v) S.TripEvery=v end})
 T:CreateSlider({Name="Reach: move only if farther than (studs)", Range={8,36}, Increment=1, CurrentValue=S.Reach, Callback=function(v) S.Reach=v end})
 T:CreateSlider({Name="Register radius (studs before returning)", Range={3,30}, Increment=1, CurrentValue=S.HomeRadius, Callback=function(v) S.HomeRadius=v end})
 T:CreateSlider({Name="Customer waits for restock (seconds)", Range={0,20}, Increment=1, CurrentValue=S.WaitStock, Callback=function(v) S.WaitStock=v end})
@@ -1792,6 +1811,20 @@ task.spawn(function()
 end)
 
 applyUI()
+task.spawn(function()
+    while alive do
+        for _ = 1, 20 do if not alive then break end task.wait(1) end
+        if getgenv().SSAF_DEBUG then
+            local rows = {}
+            for k, n in pairs(X.why) do rows[#rows+1] = {k=k, n=n} end
+            table.sort(rows, function(a, b) return a.n > b.n end)
+            local out = {}
+            for i = 1, math.min(5, #rows) do out[#out+1] = rows[i].k .. " x" .. rows[i].n end
+            if #out > 0 then dbg("teleports/20s:", table.concat(out, " | ")) end
+        end
+        table.clear(X.why)
+    end
+end)
 
 getgenv().SSAF_STOP = function()
     alive = false
@@ -1802,4 +1835,4 @@ getgenv().SSAF_STOP = function()
     for _, c in ipairs(idleOff) do pcall(function() c:Enable() end) end
     pcall(function() Rayfield:Destroy() end)
 end
-print("[SSAF] v3.3 loaded")
+print("[SSAF] v3.4 loaded")
