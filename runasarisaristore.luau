@@ -1,28 +1,36 @@
+-- Sari-Sari Store Auto Farm v3.1 | Rayfield | Plot-scoped
+-- v3.3: thief detection now uses the game's real flags (SariShoplifter / SariCrook / SlapThief) and swings the Tsinelas
+--       like the game does; open-store uses the prompt first, remote as fallback; delivery pickup waits for the whole
+--       truck to unload, then grabs every box in ONE burst (single stand point). Live register-anchored HOME, teleport governor.
+-- getgenv().SSAF_DEBUG = true BEFORE running to see decisions in the console.
 if getgenv().SSAF_STOP then pcall(getgenv().SSAF_STOP) end
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
+local CS = game:GetService("CollectionService")
 local lp = Players.LocalPlayer
 local R = RS.SariSariStore.Remotes
 local DC = require(RS.SariSariStore.Modules.DataConfig)
 
 local S = {Grab=true, Checkout=true, KashG=true, Utang=true, Load=true, Clean=true, Restock=true,
     Pickup=true, Trash=true, Bill=true, Continue=true, Tasks=true, Buy=true, Slap=true, AntiAFK=true, Unstick=true,
-    HideUI=true, SkipOut=true, Stay=true, Racks=true, Delay=0.05, Pct=100, Reserve=1000,
-    WaitStock=8, MaxItems=8, MaxBoxes=5, BuyPct=60, Reach=25, HomeRadius=8, RackPct=60, ShopReach=14}
+    HideUI=true, SkipOut=true, Stay=true, Racks=true, AutoOpen=true, Thief=true, Beggar=true, BeggarAmt=20, BuyBelow=60, Buffer=1, StandTop=false, NeedsFirst=true,
+    BuyMode="Smart", Delay=0.05, Pct=100, Reserve=1000,
+    WaitStock=8, MaxItems=12, MaxBoxes=5, BuyPct=60, Reach=25, HomeRadius=12, RackPct=60, ShopReach=30}
 local alive = true
 local conns = {}
 local stats = {served=0, change=0, kashOk=0, kashNo=0, loads=0, loadFail=0, utang=0, cleaned=0, restocked=0, picks=0,
-    picked=0, trashed=0, claimed=0, bought=0, bills=0, continued=0, slapped=0, afk=0, hops=0, homes=0, racked=0}
-
+    picked=0, trashed=0, claimed=0, bought=0, bills=0, continued=0, slapped=0, afk=0, hops=0, homes=0, racked=0,
+    opened=0, caught=0, donated=0}
+local X = {thiefNext=0, lastOpen=0, lastToggle=0, pickupBackoff=0, pickupAdded=0}
 
 local nextBuyAt, nextChore, serveUntil = 0, 0, 0
-local moveBusy = false          
-local wanted = {}               
-local demandNow = {}            
+local moveBusy = false
+local wanted = {}
+local demandNow = {}
 local bad, fail = {}, {}
-local HOME = nil                
+local HOME = nil
 local pickLockUntil, pressBackoff, lastPress = 0, 0, 0
 
 local function dbg(...) if getgenv().SSAF_DEBUG then print("[SSAF]", ...) end end
@@ -37,7 +45,7 @@ for _, p in pairs(DC.PRODUCTS) do
     name2id[(p.name:lower():gsub("[^%w]", ""))] = p.id
 end
 
-
+---------------------------------------------------------------- helpers
 local plotCache
 local function myPlot()
     if plotCache and plotCache.Parent and plotCache:GetAttribute("OwnerUserId") == lp.UserId then return plotCache end
@@ -80,7 +88,6 @@ local function hiddenUp(plot, x)
     return false
 end
 
-
 local function inactive(plot, m)
     if hiddenUp(plot, m) then return true end
     if m:GetAttribute("Locked") == true then return true end
@@ -90,10 +97,9 @@ local function inactive(plot, m)
     return false
 end
 
-
 local shelfCache, rackCache, scanT = {}, {}, 0
 local function scan(plot)
-    if tick() - scanT < 3 then return end
+    if tick() - scanT < 6 then return end
     scanT = tick()
     table.clear(shelfCache)
     table.clear(rackCache)
@@ -105,9 +111,8 @@ local function scan(plot)
         end
     end
 end
-local function shelves(plot) scan(plot) return shelfCache end   
+local function shelves(plot) scan(plot) return shelfCache end
 local function racks(plot) scan(plot) return rackCache end
-
 
 local function stockFor(plot, id, ref, ignoreBad)
     local best, bd
@@ -137,7 +142,6 @@ local function getRows(c)
     return rows
 end
 
-
 local function orderCustomer(plot)
     local reg = counterPos(plot)
     if not reg then return end
@@ -160,14 +164,13 @@ local function orderCustomer(plot)
     return best, brows, bd
 end
 
-
+---------------------------------------------------------------- movement helpers (shared)
 local function failed(k) return fail[k] and tick() - fail[k] < 10 end
 
 local function holdingTool()
     local ch = lp.Character
     return ch and ch:FindFirstChildOfClass("Tool")
 end
-
 
 local function ensureFree()
     if not holdingTool() then return end
@@ -215,7 +218,6 @@ local function handUnits(pid)
     return n
 end
 
-
 local function rackUnits(plot, pid)
     local n = 0
     for _, pr in ipairs(racks(plot)) do
@@ -228,10 +230,33 @@ local function rackUnits(plot, pid)
 end
 local function ownedUnits(plot, pid) return handUnits(pid) + rackUnits(plot, pid) end
 
-local function standAt(hrp, pos)
-    ******** = CFrame.new(pos + Vector3.new(0, 3, 0))
+-- THE ONLY place that teleports the character. Rate limited so nothing can ever spam-teleport.
+local tpLog, lastTp = {}, 0
+local function tp(cf)
+    local hrp = myHRP()
+    if not hrp then return false end
+    local now = tick()
+    while #tpLog > 0 and now - tpLog[1] > 3 do table.remove(tpLog, 1) end
+    if #tpLog >= 10 then
+        -- throttle instead of failing: wait until the oldest teleport leaves the 3s window
+        task.wait(math.max(0.05, tpLog[1] + 3 - now))
+        hrp = myHRP()
+        if not hrp then return false end
+        now = tick()
+        while #tpLog > 0 and now - tpLog[1] > 3 do table.remove(tpLog, 1) end
+    end
+    if now - lastTp < 0.12 then task.wait(0.12 - (now - lastTp)) end
+    lastTp = tick()
+    tpLog[#tpLog+1] = lastTp
+    hrp.CFrame = cf
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    stats.hops = stats.hops + 1
+    return true
 end
 
+local function standAt(hrp, pos)
+    return tp(CFrame.new(pos + Vector3.new(0, 3, 0)))
+end
 
 local baseWalk = 16
 pcall(function() baseWalk = lp.Character:FindFirstChildOfClass("Humanoid").WalkSpeed end)
@@ -247,33 +272,47 @@ local function settle()
     end
 end
 
-
 local function stream(pos)
     if not pos then return end
     task.spawn(function() pcall(function() lp:RequestStreamAroundAsync(pos, 0.4) end) end)
 end
 
-
+---------------------------------------------------------------- HOME = LIVE position next to / on top of the CashRegister
+local homeOffset = getgenv().SSAF_HOMEOFF
 local function ensureHome(plot)
-    if HOME then return end
-    local reg = counterPos(plot)
+    local reg = plot and plot:FindFirstChild("CashRegister")
     if not reg then return end
-    local saved = getgenv().SSAF_HOMECF
-    if typeof(saved) == "CFrame" and (saved.Position - reg).Magnitude < 40 then HOME = saved return end
-    local hrp = myHRP()
-    if hrp and (hrp.Position - reg).Magnitude <= 30 then
-        HOME = ********
-    else
-        HOME = ********
+    if not reg:IsA("BasePart") then
+        local rp = posOf(reg)
+        if rp then HOME = CFrame.new(rp + Vector3.new(0, 3, 3)) end
+        return
     end
-    getgenv().SSAF_HOMECF = HOME
+    local topOff = CFrame.new(0, reg.Size.Y / 2 + 3, 0)
+    if S.StandTop then
+        HOME = reg.CFrame * topOff
+        return
+    end
+    if typeof(homeOffset) ~= "CFrame" then
+        local hrp = myHRP()
+        if hrp and (hrp.Position - reg.Position).Magnitude <= 14 then
+            homeOffset = reg.CFrame:ToObjectSpace(hrp.CFrame)
+        else
+            homeOffset = topOff
+        end
+        getgenv().SSAF_HOMEOFF = homeOffset
+    end
+    HOME = reg.CFrame * homeOffset
 end
 
 local function setHome()
+    local plot = myPlot()
+    local reg = plot and plot:FindFirstChild("CashRegister")
     local hrp = myHRP()
-    if hrp then
-        HOME = ********
-        getgenv().SSAF_HOMECF = HOME
+    if reg and reg:IsA("BasePart") and hrp then
+        homeOffset = reg.CFrame:ToObjectSpace(hrp.CFrame)
+        getgenv().SSAF_HOMEOFF = homeOffset
+        S.StandTop = false
+        ensureHome(plot)
     end
 end
 
@@ -282,12 +321,12 @@ local function goHome(force)
     if not hrp or not HOME then return false end
     if not force and (hrp.Position - HOME.Position).Magnitude <= S.HomeRadius then return false end
     stream(HOME.Position)
-    ******** = HOME
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    stats.homes = stats.homes + 1
-    return true
+    if tp(HOME) then
+        stats.homes = stats.homes + 1
+        return true
+    end
+    return false
 end
-
 
 local function approach(pos, reach)
     local hrp = myHRP()
@@ -304,13 +343,10 @@ local function approach(pos, reach)
         stand = pos + Vector3.new(0, 3, 0)
     end
     stream(stand)
-    ******** = CFrame.new(stand)
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    stats.hops = stats.hops + 1
-    task.wait(0.12)
+    tp(CFrame.new(stand))
+    task.wait(0.1)
     return true
 end
-
 
 local function nearPrompt(pr, tight)
     local pos = promptPos(pr)
@@ -323,13 +359,11 @@ local function nearPrompt(pr, tight)
         if (hrp.Position - pos).Magnitude <= reach then return false end
         stream(pos)
         standAt(hrp, pos)
-        stats.hops = stats.hops + 1
-        task.wait(0.12)
+        task.wait(0.1)
         return true
     end
     return approach(pos, reach)
 end
-
 
 local function withMove(fn, ...)
     if moveBusy then return false end
@@ -343,9 +377,7 @@ local function withMove(fn, ...)
     return res
 end
 
-
-
-
+---------------------------------------------------------------- shop deliveries (TruckBay)
 local pickups, trackedPlot = {}, nil
 local function trackPickups(plot)
     if trackedPlot == plot then return end
@@ -354,24 +386,33 @@ local function trackPickups(plot)
         if d:IsA("ProximityPrompt") and d.Name == "PickupPrompt" then pickups[d] = {t=tick(), n=0} end
     end
     bind(plot.DescendantAdded, function(d)
-        if d:IsA("ProximityPrompt") and d.Name == "PickupPrompt" then pickups[d] = {t=tick(), n=0} end
+        if d:IsA("ProximityPrompt") and d.Name == "PickupPrompt" then
+            pickups[d] = {t=tick(), n=0}
+            X.pickupBackoff = 0
+            X.pickupAdded = tick()
+        end
     end)
 end
 
+local function alivePrompt(d) return d.Parent and d:IsDescendantOf(workspace) end
+
 local function hasPickup()
+    if tick() < X.pickupBackoff then return false end
     for d, e in pairs(pickups) do
-        if d.Parent and d:IsDescendantOf(workspace) and tick() - e.t < 30 and e.n < 3 then return true end
-        pickups[d] = nil
+        if not alivePrompt(d) then
+            pickups[d] = nil
+        elseif tick() - e.t < 25 and e.n < 4 then
+            return true
+        end
     end
     return false
 end
-
 
 local function abortChore()
     return tick() < serveUntil or (S.Pickup and hasPickup())
 end
 
-
+---------------------------------------------------------------- register
 local function pressRegister(plot)
     if tick() < pressBackoff or tick() - lastPress < 0.4 then return end
     lastPress = tick()
@@ -379,17 +420,16 @@ local function pressRegister(plot)
     if reg then R.RegisterPress:FireServer(reg) end
 end
 
-
 bind(R.ShowWarning.OnClientEvent, function(msg)
     if typeof(msg) ~= "string" then return end
     if msg:find("No customer at the register", 1, true) then
         pressBackoff = tick() + 1.5
     elseif msg:find("No customer is asking for this", 1, true) then
-        pickLockUntil = tick() + 0.8   
+        pickLockUntil = tick() + 0.8
     end
 end)
 
-
+---------------------------------------------------------------- hide the game's popups
 local function gameConns(remote, scriptName)
     local out = {}
     local ok, list = pcall(getconnections, remote.OnClientEvent)
@@ -414,7 +454,7 @@ local function applyUI()
 end
 
 local pg = lp:WaitForChild("PlayerGui")
-for gui, flag in pairs({KashGGui="KashG", UtangGui="Utang", CashierGui="Checkout"}) do
+for gui, flag in pairs({KashGGui="KashG", UtangGui="Utang", CashierGui="Checkout", BeggarGui="Beggar"}) do
     local g = pg:FindFirstChild(gui)
     if g then
         bind(g:GetPropertyChangedSignal("Enabled"), function()
@@ -423,7 +463,7 @@ for gui, flag in pairs({KashGGui="KashG", UtangGui="Utang", CashierGui="Checkout
     end
 end
 
-
+---------------------------------------------------------------- demand
 local lastDemand = 0
 local function scanDemand(plot)
     local ids = {}
@@ -439,7 +479,6 @@ local function scanDemand(plot)
     local ref = HOME and HOME.Position
     for id in pairs(ids) do
         if DC.getProduct(id) and not stockFor(plot, id, ref, true) then
-            
             if not (wanted[id] and tick() - wanted[id] < 60) and ownedUnits(plot, id) <= 0 then
                 nextBuyAt = math.min(nextBuyAt, tick() + 0.5)
             end
@@ -448,9 +487,7 @@ local function scanDemand(plot)
     end
 end
 
-
-
-
+---------------------------------------------------------------- grab + register loop
 local function pickShelf(shelf, tight)
     local pr = shelf:FindFirstChild("PickPrompt", true)
     if not pr then
@@ -466,6 +503,11 @@ local function pickShelf(shelf, tight)
     end
     if pr then
         nearPrompt(pr, tight)
+        local pp, hh = promptPos(pr), myHRP()
+        if pp and hh and (hh.Position - pp).Magnitude > (pr.MaxActivationDistance or 10) - 3 then
+            dbg("too far to pick", shelf.Name)
+            return false
+        end
         fireproximityprompt(pr)
     else
         R.ShelfActivate:FireServer(shelf, "pick")
@@ -479,7 +521,6 @@ local function step()
     ensureHome(plot)
     local c, rows, regDist = orderCustomer(plot)
     if not c then
-        
         if S.Stay and tick() - lastStay > 2 then
             lastStay = tick()
             stream(HOME and HOME.Position or counterPos(plot))
@@ -490,7 +531,6 @@ local function step()
     if not hrp then return end
     local ref = HOME and HOME.Position or hrp.Position
 
-    
     local plan, missIds, missing = {}, {}, false
     for _, r in ipairs(rows) do
         if r.have < r.need then
@@ -502,14 +542,14 @@ local function step()
                 if r.id then
                     missIds[#missIds+1] = r.id
                     if not (wanted[r.id] and tick() - wanted[r.id] < 60) and ownedUnits(plot, r.id) <= 0 then
-                        nextBuyAt = math.min(nextBuyAt, tick() + 0.5)   
+                        nextBuyAt = math.min(nextBuyAt, tick() + 0.5)
                     end
                     wanted[r.id] = tick()
                 end
             end
         end
     end
-    if #plan > 0 then serveUntil = tick() + 1.5 end   
+    if #plan > 0 then serveUntil = tick() + 1.5 end
     if moveBusy or tick() < settleUntil then return end
 
     local function act()
@@ -534,7 +574,7 @@ local function step()
                         local n = math.min(r.need - r.have, 12)
                         for _ = 1, n do
                             if not alive or tick() < pickLockUntil then break end
-                            pickShelf(shelf, tries >= 1)   
+                            pickShelf(shelf, tries >= 2)
                             stats.picks = stats.picks + 1
                             fired = true
                             task.wait(math.max(S.Delay, 0.06))
@@ -545,7 +585,6 @@ local function step()
             if fired then settleUntil = tick() + 0.4 end
         end
 
-        
         local hold = false
         if missing then
             local first = holdMiss[c.Name]
@@ -559,9 +598,9 @@ local function step()
             holdMiss[c.Name] = nil
         end
 
-        
         if S.Checkout and #plan == 0 and not hold and (not missing or S.SkipOut) and regDist and regDist <= 12 then
-            goHome()
+            local hr, rp = myHRP(), counterPos(plot)
+            if hr and rp and (hr.Position - rp).Magnitude > 30 then goHome(true) end
             pressRegister(plot)
             serveUntil = tick() + 0.8
         end
@@ -584,14 +623,13 @@ bind(R.OrderStatus.OnClientEvent, function(d)
         if S.Checkout then
             task.spawn(function()
                 local plot = myPlot()
-                if not moveBusy then pcall(goHome) end
                 pressRegister(plot)
             end)
         end
     end
 end)
 
-
+---------------------------------------------------------------- exact change (no UI)
 bind(R.CheckoutData.OnClientEvent, function(d)
     if S.Checkout and typeof(d) == "table" and typeof(d.change) == "number" then
         stats.change = stats.change + d.change
@@ -603,7 +641,7 @@ bind(R.CheckoutResult.OnClientEvent, function(ok)
     if ok then stats.served = stats.served + 1 end
 end)
 
-
+---------------------------------------------------------------- KashG
 bind(R.KashGAsk.OnClientEvent, function(d)
     if not S.KashG or typeof(d) ~= "table" then return end
     local img = digits(d.image)
@@ -615,7 +653,7 @@ bind(R.KashGAsk.OnClientEvent, function(d)
     if g and S.HideUI then task.defer(function() g.Enabled = false end) end
 end)
 
-
+---------------------------------------------------------------- Utang
 bind(R.UtangAsk.OnClientEvent, function(d)
     if S.Utang and typeof(d) == "table" then
         R.UtangDecide:FireServer(true)
@@ -623,7 +661,7 @@ bind(R.UtangAsk.OnClientEvent, function(d)
     end
 end)
 
-
+---------------------------------------------------------------- E-Load
 local loadBusy = false
 bind(R.PhoneLoadResult.OnClientEvent, function(ok, msg)
     loadBusy = false
@@ -652,7 +690,7 @@ task.spawn(function()
     end
 end)
 
-
+---------------------------------------------------------------- popups
 local function press(btn)
     pcall(function() firesignal(btn.Activated) end)
     pcall(function() firesignal(btn.MouseButton1Click) end)
@@ -668,7 +706,7 @@ task.spawn(function()
                 lastDS = tick()
                 local b = ds:FindFirstChild("ContinueButton", true)
                 if b then
-                    task.wait(0.8)   
+                    task.wait(0.8)
                     press(b)
                     stats.continued = stats.continued + 1
                     dbg("Day summary: Continue")
@@ -680,7 +718,7 @@ task.spawn(function()
                 local b = eb:FindFirstChild("PayButton", true)
                 if b then press(b) end
                 task.wait(0.8)
-                if eb.Enabled then R.ElectricityChoice:FireServer("pay") end   
+                if eb.Enabled then R.ElectricityChoice:FireServer("pay") end
                 stats.bills = stats.bills + 1
                 dbg("Electric bill: PAY NOW")
             end
@@ -688,7 +726,7 @@ task.spawn(function()
     end
 end)
 
-
+---------------------------------------------------------------- daily tasks
 task.spawn(function()
     while alive do
         if S.Tasks then
@@ -710,44 +748,89 @@ task.spawn(function()
     end
 end)
 
-
+---------------------------------------------------------------- FAST delivery pickup
+-- Waits (max ~0.9s) until the truck has finished unloading, then stands ONCE at the centre of all boxes and fires every
+-- prompt in one burst. Anything left behind triggers a short backoff instead of teleport ping-pong.
 local function pickupPass()
-    local hrp = myHRP()
-    if not hrp then return false end
-    local did = false
+    local t0 = tick()
+    while tick() - X.pickupAdded < 0.22 and tick() - t0 < 0.9 do task.wait(0.03) end
+    local live = {}
     for d, e in pairs(pickups) do
-        if d.Parent and d:IsDescendantOf(workspace) then
-            e.n = e.n + 1
-            local pos = promptPos(d)
-            if pos then
-                for _ = 1, 5 do
-                    if not (d.Parent and d:IsDescendantOf(workspace)) then break end
-                    hrp = myHRP()
-                    if not hrp then break end
-                    standAt(hrp, pos)
-                    task.wait(0.12)
-                    fireproximityprompt(d)
-                    local t = tick()
-                    while d.Parent and d:IsDescendantOf(workspace) and tick() - t < 0.7 do task.wait(0.05) end
-                end
+        if alivePrompt(d) and tick() - e.t < 25 and e.n < 4 then live[#live+1] = d end
+    end
+    if #live == 0 then return false end
+    ensureFree()
+    for _ = 1, 8 do
+        local pts = {}
+        for _, d in ipairs(live) do
+            if alivePrompt(d) then
+                local p = promptPos(d)
+                if p then pts[#pts+1] = {d=d, p=p} end
             end
-            if not (d.Parent and d:IsDescendantOf(workspace)) then
-                stats.picked = stats.picked + 1
-                did = true
-                pickups[d] = nil
-                nextBuyAt = math.min(nextBuyAt, tick() + 1)   
-                nextChore = 0                                  
-                dbg("Picked up delivery", d.ObjectText)
+        end
+        if #pts == 0 then break end
+        local sum = Vector3.zero
+        for _, e in ipairs(pts) do sum = sum + e.p end
+        local c = sum / #pts
+        local spread = 0
+        for _, e in ipairs(pts) do spread = math.max(spread, (e.p - c).Magnitude) end
+        local hrp = myHRP()
+        if not hrp then break end
+        if spread <= 9 then
+            if (hrp.Position - c).Magnitude > 4 then
+                stream(c)
+                standAt(hrp, c)
+                task.wait(0.08)
+            end
+            for _, e in ipairs(pts) do
+                pcall(function() e.d.HoldDuration = 0 end)
+                fireproximityprompt(e.d)
             end
         else
+            table.sort(pts, function(a, b)
+                return (a.p - hrp.Position).Magnitude < (b.p - hrp.Position).Magnitude
+            end)
+            for _, e in ipairs(pts) do
+                hrp = myHRP()
+                if not hrp then break end
+                if (hrp.Position - e.p).Magnitude > 8 then
+                    stream(e.p)
+                    standAt(hrp, e.p)
+                    task.wait(0.08)
+                end
+                pcall(function() e.d.HoldDuration = 0 end)
+                fireproximityprompt(e.d)
+            end
+        end
+        local left, t = 1, tick()
+        repeat
+            task.wait(0.05)
+            left = 0
+            for _, e in ipairs(pts) do if alivePrompt(e.d) then left = left + 1 end end
+        until left == 0 or tick() - t > 0.45
+        if left == 0 then break end
+    end
+    local did, remaining = false, 0
+    for _, d in ipairs(live) do
+        if alivePrompt(d) then
+            remaining = remaining + 1
+            if pickups[d] then pickups[d].n = pickups[d].n + 1 end
+        else
+            stats.picked = stats.picked + 1
+            did = true
             pickups[d] = nil
         end
     end
+    if did then
+        nextBuyAt = math.min(nextBuyAt, tick() + 1)
+        nextChore = 0
+        dbg("Picked up delivery:", #live - remaining, "boxes")
+    end
+    if remaining > 0 then X.pickupBackoff = tick() + 2.5 end
     return did
 end
 
-
-
+---------------------------------------------------------------- trash
 bind(R.TrashConfirm.OnClientEvent, function()
     if not S.Trash then return end
     task.delay(0.25, function()
@@ -801,9 +884,7 @@ local function trashPass(plot)
     return did
 end
 
-
-
-
+---------------------------------------------------------------- smart restock
 local function targetShelf(plot, box, pid, ref)
     local prod = DC.getProduct(pid)
     local cat = box:GetAttribute("ShelfCategory") or (prod and prod.category) or "general"
@@ -814,7 +895,6 @@ local function targetShelf(plot, box, pid, ref)
             local sp = m:GetAttribute("ProductId") or ""
             local stock = m:GetAttribute("Stock") or 0
             local cap = m:GetAttribute("Capacity") or 0
-            
             local usable = cap > 0 and not failed(m)
             if sp == pid then
                 claimed = claimed + 1
@@ -844,7 +924,6 @@ local function targetShelf(plot, box, pid, ref)
     end
 end
 
-
 local function urgency(plot, pid)
     local worst
     for _, m in ipairs(shelves(plot)) do
@@ -873,7 +952,6 @@ local function needUnits(plot, pid)
     end
     return need
 end
-
 
 local function takeFromRack(plot, pid)
     local hrp = myHRP()
@@ -912,7 +990,6 @@ local function takeFromRack(plot, pid)
     return false
 end
 
-
 local dummyBox = {GetAttribute = function() return nil end}
 local function rackPass(plot)
     if not S.Racks then return false end
@@ -935,7 +1012,6 @@ local function rackPass(plot)
         local id = o.id
         if DC.getProduct(id) and rackUnits(plot, id) > 0 then
             local ref = HOME and HOME.Position
-            
             if targetShelf(plot, dummyBox, id, ref) then
                 handled = handled + 1
                 local taken = 0
@@ -957,7 +1033,6 @@ local function restockPass(plot)
     local did = rackPass(plot)
     local boxes = collectBoxes()
     if #boxes == 0 then return did end
-    
     local rank = {}
     for _, b in ipairs(boxes) do
         local pid = b:GetAttribute("ProductId")
@@ -988,11 +1063,19 @@ local function restockPass(plot)
                 until pr or tick() - t > 0.8
             end
             if not pr then
-                fail[shelf] = tick() + 20   
+                fail[shelf] = tick() + 20
                 dbg("No RestockPrompt on", shelf.Name)
                 continue
             end
             nearPrompt(pr)
+            do
+                local pp, hh = promptPos(pr), myHRP()
+                if pp and hh and (hh.Position - pp).Magnitude > (pr.MaxActivationDistance or 10) - 3 then
+                    fail[shelf] = tick()
+                    dbg("restock: shelf out of reach", shelf.Name)
+                    continue
+                end
+            end
             if not equip(box) then break end
             local before = shelf:GetAttribute("Stock") or 0
             fireproximityprompt(pr)
@@ -1005,7 +1088,6 @@ local function restockPass(plot)
                 wanted[pid] = nil
                 dbg("Restocked", pid, "->", shelf.Name, before, "=>", after)
             else
-                
                 nearPrompt(pr, true)
                 fireproximityprompt(pr)
                 t = tick()
@@ -1025,7 +1107,7 @@ local function restockPass(plot)
     return did
 end
 
-
+---------------------------------------------------------------- cleaning
 local pileCache, pileT = {}, 0
 local function piles(plot)
     if tick() - pileT > 3 then
@@ -1102,8 +1184,8 @@ local function cleanPass(plot)
     return true
 end
 
-
-local CS = game:GetService("CollectionService")
+---------------------------------------------------------------- Tsinelas: wake workers + catch thieves
+local HIT_TOOL = DC.HIT_TOOL_NAME or "Tsinelas"
 local slapT = {}
 local function slapPass()
     local asleep = {}
@@ -1114,7 +1196,7 @@ local function slapPass()
         end
     end
     if #asleep == 0 then return false end
-    local tool = getTool("Tsinelas")
+    local tool = getTool(HIT_TOOL)
     local hrp = myHRP()
     if not tool or not hrp then return false end
     local did = false
@@ -1124,8 +1206,8 @@ local function slapPass()
         hrp = myHRP()
         if not hrp then break end
         local wr = w:FindFirstChild("HumanoidRootPart")
-        if wr and (hrp.Position - wr.Position).Magnitude > 8 then
-            ******** = wr.CFrame * CFrame.new(0, 0, 3)
+        if wr and (hrp.Position - wr.Position).Magnitude > 6 then
+            tp(wr.CFrame * CFrame.new(0, 0, 3))
             task.wait(0.25)
         end
         for _ = 1, 2 do
@@ -1146,7 +1228,128 @@ local function slapPass()
     return did
 end
 
+-- the game's own thief flags (from HitClient / ShopliftAlertClient): SariShoplifter == true, SariCrook == true, tag SlapThief.
+-- Only thieves near YOUR register are chased.
+local function isThief(m, regPos)
+    if not m.Parent or m == lp.Character then return false end
+    local root = m:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    if m:GetAttribute("SariWorkerOwner") then return false end
+    if regPos and (root.Position - regPos).Magnitude > 160 then return false end
+    local owner = m:GetAttribute("SukiOwnerId")
+    if owner ~= nil and owner ~= lp.UserId then return false end
+    return m:GetAttribute("SariShoplifter") == true or m:GetAttribute("SariCrook") == true or CS:HasTag(m, "SlapThief")
+end
 
+local function thiefList()
+    local out, seen = {}, {}
+    local plot = myPlot()
+    local regPos = plot and counterPos(plot)
+    local function consider(m)
+        if typeof(m) ~= "Instance" then return end
+        if not m:IsA("Model") then m = m:FindFirstAncestorOfClass("Model") end
+        if not m or seen[m] then return end
+        seen[m] = true
+        if isThief(m, regPos) then out[#out+1] = m end
+    end
+    for _, m in ipairs(CS:GetTagged("SlapThief")) do consider(m) end
+    for _, c in ipairs(workspace:GetChildren()) do
+        if c:IsA("Model") and c:FindFirstChild("Humanoid") then consider(c) end
+    end
+    return out
+end
+
+bind(R.ShopliftAlert.OnClientEvent, function(...) X.thiefNext = 0 dbg("ShopliftAlert", ...) end)
+bind(R.ThiefStatus.OnClientEvent, function(...) X.thiefNext = 0 dbg("ThiefStatus", ...) end)
+
+local function thiefPass()
+    local list = thiefList()
+    if #list == 0 then return false end
+    local tool = getTool(HIT_TOOL)
+    if not tool then dbg("No Tsinelas for the thief") return false end
+    if not equip(tool) then return false end
+    local t0, hit = tick(), false
+    while alive and tick() - t0 < 16 do
+        if S.Pickup and hasPickup() then break end
+        list = thiefList()
+        if #list == 0 then break end
+        local th = list[1]
+        local tr = th:FindFirstChild("HumanoidRootPart")
+        local hrp = myHRP()
+        if not (tr and hrp) then break end
+        if (hrp.Position - tr.Position).Magnitude > 9 then
+            tp(tr.CFrame * CFrame.new(0, 0, 4))
+            task.wait(0.05)
+            hrp = myHRP()
+            if not hrp then break end
+        end
+        -- face the thief (the server checks facing), swing like the game does, then report the hit
+        hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(tr.Position.X, hrp.Position.Y, tr.Position.Z))
+        pcall(function() tool:Activate() end)
+        task.wait(0.06)
+        R.HitNPC:FireServer(th)
+        hit = true
+        task.wait(0.3)
+    end
+    if hit and #thiefList() == 0 then
+        stats.caught = stats.caught + 1
+        dbg("Thief down")
+    end
+    local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+    if hum then hum:UnequipTools() end
+    return hit
+end
+
+---------------------------------------------------------------- keep the store open 24/7
+local function openStorePass(plot)
+    if not S.AutoOpen then return false end
+    if plot:GetAttribute("StoreOpen") ~= false then return false end
+    if tick() - X.lastOpen < 3 then return false end
+    X.lastOpen = tick()
+    local pr = plot:FindFirstChild("OpenClosePrompt", true)
+    if pr then
+        local pos, hrp = promptPos(pr), myHRP()
+        if pos and hrp and (hrp.Position - pos).Magnitude > (pr.MaxActivationDistance or 25) - 8 then
+            approach(pos, 14)
+        end
+        fireproximityprompt(pr)
+        local t = tick()
+        while plot:GetAttribute("StoreOpen") == false and tick() - t < 0.8 do task.wait(0.05) end
+    end
+    if plot:GetAttribute("StoreOpen") == false and tick() - X.lastToggle > 3 then
+        X.lastToggle = tick()
+        pcall(function() R.ToggleStoreOpen:FireServer() end)
+        local t = tick()
+        while plot:GetAttribute("StoreOpen") == false and tick() - t < 1.2 do task.wait(0.05) end
+    end
+    if plot:GetAttribute("StoreOpen") ~= false then
+        stats.opened = stats.opened + 1
+        dbg("Store re-opened")
+        return true
+    end
+    return false
+end
+
+---------------------------------------------------------------- beggar: always donate (ignoring beggars costs honor)
+local BEGGAR_AMTS = {1, 5, 10, 20, 50, 100, 500, 1000}
+bind(R.BeggarRequest.OnClientEvent, function(...)
+    if not S.Beggar then return end
+    local info = {...}
+    task.delay(0.35, function()
+        local cash, amt = money(), 0
+        for i = #BEGGAR_AMTS, 1, -1 do
+            local a = BEGGAR_AMTS[i]
+            if a <= S.BeggarAmt and a <= cash then amt = a break end
+        end
+        R.BeggarGive:FireServer(amt)
+        if amt > 0 then stats.donated = stats.donated + 1 end
+        dbg("Beggar: gave", amt, #info)
+        local g = pg:FindFirstChild("BeggarGui")
+        if g and S.HideUI then g.Enabled = false end
+    end)
+end)
+
+---------------------------------------------------------------- anti-AFK + unstick
 local VU = game:GetService("VirtualUser")
 local idleOff = {}
 for _, c in ipairs(getconnections(lp.Idled)) do
@@ -1166,7 +1369,7 @@ task.spawn(function()
     while alive do
         task.wait(1)
         n = n + 1
-        if S.AntiAFK and n % 50 == 0 then antiAfk() end   
+        if S.AntiAFK and n % 50 == 0 then antiAfk() end
         local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
         if S.Unstick and hum then
             if hum:GetState() == Enum.HumanoidStateType.Climbing then
@@ -1183,11 +1386,11 @@ task.spawn(function()
     end
 end)
 
-
+---------------------------------------------------------------- scheduler
 task.spawn(function()
     local lastHomeFix, lastStream = 0, 0
     while alive do
-        task.wait(0.2)
+        task.wait(0.1)
         pcall(function()
             local plot = myPlot()
             if not plot or not lp.Character or not myHRP() then return end
@@ -1203,21 +1406,30 @@ task.spawn(function()
             end
             if moveBusy then return end
             if S.Pickup and hasPickup() then withMove(pickupPass) return end
-            
-            if S.Stay and HOME and tick() - lastHomeFix > 1 then
+            if S.Thief and tick() >= X.thiefNext then
+                if #thiefList() > 0 then
+                    withMove(thiefPass)
+                    X.thiefNext = tick() + 0.2
+                    return
+                end
+                X.thiefNext = tick() + 0.35
+            end
+            if S.AutoOpen and plot:GetAttribute("StoreOpen") == false then
+                if withMove(openStorePass, plot) then return end
+            end
+            if S.Stay and HOME and tick() - lastHomeFix > 2 then
                 local hrp = myHRP()
-                if hrp and (hrp.Position - HOME.Position).Magnitude > S.HomeRadius + 4 then
+                if hrp and (hrp.Position - HOME.Position).Magnitude > S.HomeRadius + 6 then
                     lastHomeFix = tick()
                     withMove(function() end)
-                    dbg("Watchdog: back to the counter")
+                    dbg("Watchdog: back to the register")
                     return
                 end
             end
             if S.Slap and tick() >= serveUntil then withMove(slapPass) end
-            if tick() < serveUntil or tick() < nextChore then return end   
+            if tick() < serveUntil or tick() < nextChore then return end
             nextChore = tick() + 0.5
             local did = false
-            
             if S.Restock then did = withMove(restockPass, plot) or did end
             if S.Trash then did = withMove(trashPass, plot) or did end
             if S.Clean then did = withMove(cleanPass, plot) or did end
@@ -1229,11 +1441,7 @@ task.spawn(function()
     end
 end)
 
-
-
-
-
-
+---------------------------------------------------------------- smart buying from the shop
 local buyFail, lastRes = {}, nil
 bind(R.PurchaseResult.OnClientEvent, function(ok, msg) lastRes = {ok, msg} end)
 
@@ -1268,13 +1476,13 @@ local function goShop(plot, tight)
     local pos = posOf(getgenv().SSAF_SHOP) or (pr and promptPos(pr))
     local hrp = myHRP()
     if not pos or not hrp then return false end
-    stream(pos)
     local reach = tight and 5 or S.ShopReach
     if (hrp.Position - pos).Magnitude > reach then
+        stream(pos)
         if reach <= 8 then standAt(hrp, pos) else approach(pos, reach) end
-        task.wait(0.35)
+        task.wait(0.3)
+        settle()
     end
-    settle()
     return true
 end
 
@@ -1294,6 +1502,8 @@ local function placeOrder(items)
     return lastRes and lastRes[1] == true, lastRes and lastRes[2]
 end
 
+local BUY_MODES = {"Smart", "Highest value", "Lowest value", "Best profit", "Best ROI"}
+
 local function planOrder(rep)
     local dem, now = {}, tick()
     local function bump(id, need, prio, boxes)
@@ -1304,7 +1514,6 @@ local function planOrder(rep)
         if prio > d.prio then d.prio = prio end
         if boxes and boxes > d.box then d.box = boxes end
     end
-    
     for _, group in ipairs({{rep.outOfStock, true}, {rep.lowStock, false}}) do
         for _, e in ipairs(group[1] or {}) do
             local prod = DC.getProduct(e.id)
@@ -1314,10 +1523,9 @@ local function planOrder(rep)
             end
         end
     end
-    
     local plot = myPlot()
     if plot then
-        local need, capSum, anyEmpty = {}, {}, {}
+        local need, capSum, anyEmpty, minR = {}, {}, {}, {}
         for _, m in ipairs(shelves(plot)) do
             local id, cap = m:GetAttribute("ProductId"), m:GetAttribute("Capacity") or 0
             if id and id ~= "" and cap > 0 then
@@ -1325,15 +1533,16 @@ local function planOrder(rep)
                 need[id] = (need[id] or 0) + (cap - st)
                 capSum[id] = (capSum[id] or 0) + cap
                 if st <= 0 then anyEmpty[id] = true end
+                local rr = st / cap
+                if not minR[id] or rr < minR[id] then minR[id] = rr end
             end
         end
         for id, n in pairs(need) do
-            if DC.getProduct(id) and (anyEmpty[id] or n >= capSum[id] * 0.35) then
+            if DC.getProduct(id) and (anyEmpty[id] or (minR[id] or 1) <= S.BuyBelow / 100 or n >= capSum[id] * 0.5) then
                 bump(id, n, anyEmpty[id] and 2 or 1)
             end
         end
     end
-    
     for id, t in pairs(wanted) do
         if now - t < 60 then
             local prod = DC.getProduct(id)
@@ -1343,34 +1552,68 @@ local function planOrder(rep)
         end
     end
 
-    
     local inv = {}
     pcall(function() inv = R.GetInventoryCounts:InvokeServer() or {} end)
     if typeof(inv) ~= "table" then inv = {} end
 
+    local cash = money()
+    local mode = S.BuyMode
     local list = {}
-    for _, d in pairs(dem) do list[#list+1] = d end
+    for _, d in pairs(dem) do
+        local prod = DC.getProduct(d.id)
+        local size = prod and (DC.getBoxSize(prod) or 10) or 10
+        local buy, sell = prod and prod.buy or 0, prod and (prod.sell or prod.buy) or 0
+        d.cost = math.max(buy * size, 1)
+        d.profit = (sell - buy) * size
+        d.roi = (sell - buy) / math.max(buy, 0.5)
+        d.urg = plot and urgency(plot, d.id) or -1
+        d.hot = lp:GetAttribute("HotItem") == d.id
+        d.tier = S.NeedsFirst and ((d.prio >= 3 and 2) or (d.prio >= 2 and 1) or 0) or 0
+        if mode == "Highest value" then
+            d.score = d.tier * 1e6 + d.cost
+        elseif mode == "Lowest value" then
+            d.score = d.tier * 1e6 - d.cost
+        elseif mode == "Best profit" then
+            d.score = d.tier * 1e6 + d.profit
+        elseif mode == "Best ROI" then
+            d.score = d.tier * 1e6 + d.roi * 1000
+        else
+            local base = (cash < 4000) and (d.roi * 600) or math.min(d.profit, 3000)
+            d.score = d.tier * 1e6 + (1 - math.min(d.urg, 1)) * 2500 + base + (d.hot and 800 or 0)
+        end
+        list[#list+1] = d
+    end
     table.sort(list, function(a, b)
-        if a.prio ~= b.prio then return a.prio > b.prio end
+        if a.score ~= b.score then return a.score > b.score end
         return a.need > b.need
     end)
 
-    local cash = money()
-    local avail = cash - S.Reserve                 
-    local urgent = cash - S.Reserve * 0.3          
-    local budget = math.max(avail, 0) * (S.BuyPct / 100)
+    local pctNow = S.BuyPct
+    if mode == "Smart" then pctNow = (cash < 3000 and 40) or (cash < 15000 and 60) or 80 end
+    local avail = cash - S.Reserve
+    local urgent = cash - S.Reserve * 0.3
+    local budget = math.max(avail, 0) * (pctNow / 100)
     local items, total = {}, 0
     for _, d in ipairs(list) do
         if #items >= S.MaxItems or urgent <= 0 then break end
         local prod = DC.getProduct(d.id)
         if prod and not (buyFail[d.id] and now - buyFail[d.id] < 120) then
             local size = DC.getBoxSize(prod) or 10
-            local owned = math.max(d.box, handUnits(d.id), tonumber(inv[d.id]) or 0, plot and rackUnits(plot, d.id) + handUnits(d.id) or 0)
+            local shelfStock = 0
+            if plot then
+                for _, m in ipairs(shelves(plot)) do
+                    if m:GetAttribute("ProductId") == d.id then shelfStock = shelfStock + (m:GetAttribute("Stock") or 0) end
+                end
+            end
+            local spare = math.max((tonumber(inv[d.id]) or 0) - shelfStock, handUnits(d.id) + (plot and rackUnits(plot, d.id) or 0), 0)
+            local owned = spare
             local deficit = d.need - owned
             if deficit > 0 then
                 local limitOk, lim = pcall(DC.marketStockLimit, d.id)
-                local boxes = math.min(math.ceil(deficit / size), (limitOk and tonumber(lim)) or 3, S.MaxBoxes)
-                local unit = (prod.buy or 0) * ((lp:GetAttribute("HotItem") == d.id) and 1.2 or 1)
+                local want = math.ceil(deficit / size)
+                if S.Buffer > 0 and cash > S.Reserve * 4 + 5000 then want = want + S.Buffer end
+                local boxes = math.min(want, (limitOk and tonumber(lim)) or 3, S.MaxBoxes)
+                local unit = (prod.buy or 0) * (d.hot and 1.2 or 1)
                 local cost = math.max(unit * size, 1)
                 local cap = (d.prio >= 2) and urgent or math.min(budget, avail)
                 boxes = math.min(boxes, math.floor(cap / cost))
@@ -1387,21 +1630,18 @@ local function planOrder(rep)
     return items, total
 end
 
-
 local function orderItems(items, total)
     local success, msg = placeOrder(items)
     if not success and msg == nil then return "far", "no answer from the server", items, 0 end
     if not success and distMsg(msg) then return "far", msg, items, 0 end
     local soldName = (not success) and tostring(msg):match("^(.-) is sold out")
     if soldName then
-        
         local sid = name2id[(soldName:lower():gsub("[^%w]", ""))]
         if sid then buyFail[sid] = tick() end
         dbg("Sold out in the market:", soldName)
         return "sold", msg, items, 0
     end
     if not success and not tostring(msg):find("on its way", 1, true) then
-        
         for _, item in ipairs(items) do
             local s2, m2 = placeOrder({item})
             if s2 then return "ok", m2, {item}, item.qty end
@@ -1413,7 +1653,7 @@ local function orderItems(items, total)
         return "fail", msg, items, 0
     end
     if success then return "ok", msg, items, total end
-    return "wait", msg, items, 0   
+    return "wait", msg, items, 0
 end
 
 local function smartBuy()
@@ -1431,7 +1671,7 @@ local function smartBuy()
         local entered = false
         withMove(function()
             entered = true
-            goShop(plot, attempt == 2)      
+            goShop(plot, attempt == 2)
             st, msg, placed, n = orderItems(items, total)
         end)
         if not entered then st = "busy" break end
@@ -1467,15 +1707,19 @@ task.spawn(function()
     end
 end)
 
-
-local Win = Rayfield:CreateWindow({Name="Sari-Sari Auto v2.6", LoadingTitle="Sari-Sari Auto v2.6", ConfigurationSaving={Enabled=false}})
+---------------------------------------------------------------- UI
+local Win = Rayfield:CreateWindow({Name="Sari-Sari Auto v3.3", LoadingTitle="Sari-Sari Auto v3.1", ConfigurationSaving={Enabled=false}})
 local T = Win:CreateTab("Main")
 local function tog(name, key)
     T:CreateToggle({Name=name, CurrentValue=S[key], Callback=function(v) S[key]=v applyUI() end})
 end
-tog("Auto Grab (hops to shelves, skips out-of-stock)", "Grab")
+tog("Auto Grab (skips out-of-stock)", "Grab")
 tog("Auto Register + Exact Change", "Checkout")
-tog("Stay at the counter (always return home)", "Stay")
+tog("Stay at the register (live position)", "Stay")
+tog("Stand ON TOP of the register", "StandTop")
+tog("Auto Open store 24/7", "AutoOpen")
+tog("Auto Catch Thief (Tsinelas strike)", "Thief")
+tog("Auto Donate to Beggar", "Beggar")
 tog("Auto KashG (accept real / decline fake)", "KashG")
 tog("Auto Accept Utang", "Utang")
 tog("Auto E-Load (no phone UI)", "Load")
@@ -1483,8 +1727,9 @@ tog("Auto Clean Dust / Leaves", "Clean")
 tog("Auto Restock shelves from backpack", "Restock")
 tog("Take boxes from racks when shelves run low", "Racks")
 tog("Auto Throw Away empty boxes", "Trash")
-tog("Auto Pick Up shop deliveries", "Pickup")
-tog("Smart Buy (walks to the shop computer)", "Buy")
+tog("Auto Pick Up shop deliveries (fast)", "Pickup")
+tog("Smart Buy (shop computer)", "Buy")
+tog("Buy: customer-wanted / empty items first", "NeedsFirst")
 tog("Auto Pay Electric Bill", "Bill")
 tog("Auto Continue (day summary)", "Continue")
 tog("Auto Claim Daily Tasks", "Tasks")
@@ -1493,17 +1738,29 @@ tog("Anti-AFK", "AntiAFK")
 tog("Auto Unstick (Climbing freeze)", "Unstick")
 tog("Hide game popups (register / KashG / Utang)", "HideUI")
 tog("Checkout even if an item is out of stock", "SkipOut")
-T:CreateButton({Name="Set HOME here (stand at your counter spot first)", Callback=function() setHome() end})
-T:CreateButton({Name="Go home now", Callback=function() withMove(function() goHome(true) settle() end) end})
+T:CreateDropdown({Name="Buy priority", Options=BUY_MODES, CurrentOption={S.BuyMode}, MultipleOptions=false,
+    Callback=function(o)
+        local v = typeof(o) == "table" and o[1] or o
+        if typeof(v) == "string" then S.BuyMode = v nextBuyAt = 0 end
+    end})
+T:CreateDropdown({Name="Beggar donation (P)", Options={"1","5","10","20","50","100","500","1000"}, CurrentOption={tostring(S.BeggarAmt)}, MultipleOptions=false,
+    Callback=function(o)
+        local v = tonumber(typeof(o) == "table" and o[1] or o)
+        if v then S.BeggarAmt = v end
+    end})
+T:CreateSlider({Name="Buy when a shelf is at or below (%)", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.BuyBelow, Callback=function(v) S.BuyBelow=v nextBuyAt=0 end})
+T:CreateSlider({Name="Extra buffer boxes when cash is high", Range={0,3}, Increment=1, CurrentValue=S.Buffer, Callback=function(v) S.Buffer=v end})
+T:CreateButton({Name="Set stand spot here (relative to register)", Callback=function() setHome() end})
+T:CreateButton({Name="Go to register now", Callback=function() withMove(function() goHome(true) settle() end) end})
 T:CreateButton({Name="Buy now", Callback=function() nextBuyAt = 0 end})
 T:CreateSlider({Name="Keep this much cash when buying (P)", Range={0,10000}, Increment=250, CurrentValue=S.Reserve, Callback=function(v) S.Reserve=v end})
-T:CreateSlider({Name="Spend this % of spare cash per order", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.BuyPct, Callback=function(v) S.BuyPct=v end})
+T:CreateSlider({Name="Spend this % of spare cash per order (non-Smart)", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.BuyPct, Callback=function(v) S.BuyPct=v end})
 T:CreateSlider({Name="Max different items per order", Range={1,12}, Increment=1, CurrentValue=S.MaxItems, Callback=function(v) S.MaxItems=v end})
 T:CreateSlider({Name="Max boxes per item", Range={1,10}, Increment=1, CurrentValue=S.MaxBoxes, Callback=function(v) S.MaxBoxes=v end})
 T:CreateSlider({Name="Refill shelf when below (%)", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.Pct, Callback=function(v) S.Pct=v end})
 T:CreateSlider({Name="Fetch rack boxes when shelf below (%)", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.RackPct, Callback=function(v) S.RackPct=v end})
-T:CreateSlider({Name="Reach: hop only if shelf is farther than (studs)", Range={8,36}, Increment=1, CurrentValue=S.Reach, Callback=function(v) S.Reach=v end})
-T:CreateSlider({Name="Counter spot radius (studs)", Range={3,20}, Increment=1, CurrentValue=S.HomeRadius, Callback=function(v) S.HomeRadius=v end})
+T:CreateSlider({Name="Reach: move only if farther than (studs)", Range={8,36}, Increment=1, CurrentValue=S.Reach, Callback=function(v) S.Reach=v end})
+T:CreateSlider({Name="Register radius (studs before returning)", Range={3,30}, Increment=1, CurrentValue=S.HomeRadius, Callback=function(v) S.HomeRadius=v end})
 T:CreateSlider({Name="Customer waits for restock (seconds)", Range={0,20}, Increment=1, CurrentValue=S.WaitStock, Callback=function(v) S.WaitStock=v end})
 T:CreateSlider({Name="Action Delay", Range={0.03,1}, Increment=0.01, CurrentValue=S.Delay, Callback=function(v) S.Delay=v end})
 local lbl1 = T:CreateLabel("Starting...")
@@ -1515,8 +1772,8 @@ task.spawn(function()
         pcall(function()
             lbl1:Set(string.format("Served %d | Picks %d | Change P%d | KashG +%d/-%d | Load %d (fail %d) | Utang %d",
                 stats.served, stats.picks, stats.change, stats.kashOk, stats.kashNo, stats.loads, stats.loadFail, stats.utang))
-            lbl2:Set(string.format("Restocked %d | Racked %d | Bought %d | Picked up %d | Trashed %d | Cleaned %d | Tasks %d | Bills %d | Days %d | Woke %d | AFK %d",
-                stats.restocked, stats.racked, stats.bought, stats.picked, stats.trashed, stats.cleaned, stats.claimed, stats.bills, stats.continued, stats.slapped, stats.afk))
+            lbl2:Set(string.format("Restocked %d | Racked %d | Bought %d | Picked up %d | Trashed %d | Cleaned %d | Tasks %d | Bills %d | Days %d | Woke %d | Thieves %d | Opened %d",
+                stats.restocked, stats.racked, stats.bought, stats.picked, stats.trashed, stats.cleaned, stats.claimed, stats.bills, stats.continued, stats.slapped, stats.caught, stats.opened))
             local plot = myPlot()
             local empty, wantedN = 0, 0
             if plot then
@@ -1527,8 +1784,8 @@ task.spawn(function()
             for _, t in pairs(wanted) do if tick() - t < 60 then wantedN = wantedN + 1 end end
             local hrp = myHRP()
             local hd = (hrp and HOME) and math.floor((hrp.Position - HOME.Position).Magnitude) or -1
-            lbl3:Set(string.format("Empty shelves %d | Wanted %d | Hops %d | Homes %d | From home %d studs | Boxes in bag %d",
-                empty, wantedN, stats.hops, stats.homes, hd, #collectBoxes()))
+            lbl3:Set(string.format("Empty shelves %d | Wanted %d | Teleports %d | Returns %d | From register %d studs | Boxes %d | Store %s",
+                empty, wantedN, stats.hops, stats.homes, hd, #collectBoxes(), tostring(plot and plot:GetAttribute("StoreOpen"))))
         end)
         task.wait(1)
     end
@@ -1545,3 +1802,4 @@ getgenv().SSAF_STOP = function()
     for _, c in ipairs(idleOff) do pcall(function() c:Enable() end) end
     pcall(function() Rayfield:Destroy() end)
 end
+print("[SSAF] v3.3 loaded")
