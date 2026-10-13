@@ -1,11 +1,18 @@
--- Sari-Sari Store Auto Farm v3.1 | Rayfield | Plot-scoped
+-- Sari-Sari Store Auto Farm v3.1 | Speed Hub UI | Plot-scoped
 -- v3.1: thief detection now uses the game's real flags (SariShoplifter / SariCrook / SlapThief) and swings the Tsinelas
 --       like the game does; open-store uses the prompt first, remote as fallback; delivery pickup waits for the whole
 --       truck to unload, then grabs every box in ONE burst (single stand point). Live register-anchored HOME, teleport governor.
 -- getgenv().SSAF_DEBUG = true BEFORE running to see decisions in the console.
 if getgenv().SSAF_STOP then pcall(getgenv().SSAF_STOP) end
 
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+local UI = {}
+UI.BASE = "https://raw.githubusercontent.com/yurischevalier/scriptlibrary/refs/heads/main/"
+UI.Funcs = loadstring(game:HttpGet(UI.BASE .. "FuncsV3.lua"))()
+UI.root = (gethui and gethui()) or game:GetService("CoreGui")
+UI.before = {}
+for _, g in ipairs(UI.root:GetChildren()) do UI.before[g] = true end
+UI.Lib = loadstring(game:HttpGet(UI.BASE .. "speedhub.lua"))()
+UI.guis = {}
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local CS = game:GetService("CollectionService")
@@ -18,6 +25,11 @@ local S = {Grab=true, Checkout=true, KashG=true, Utang=true, Load=true, Clean=tr
     HideUI=true, SkipOut=true, Stay=true, Racks=true, AutoOpen=true, Thief=true, Beggar=true, BeggarAmt=20, Rebirth=false, Codes=true, UtangCollect=true, BuyBelow=60, Buffer=1, TripEvery=6, StandTop=false, NeedsFirst=true,
     BuyMode="Smart", Delay=0.03, Pct=100, Reserve=1000,
     WaitStock=8, MaxItems=12, MaxBoxes=5, BuyPct=60, Reach=32, HomeRadius=12, RackPct=60, ShopReach=30}
+-- auto configuration: everything starts ON, except Rebirth (it resets the store) and the removed Codes / StandTop
+S.Parcel = true
+S.Codes = false
+S.StandTop = false
+S.Rebirth = false
 local alive = true
 local conns = {}
 local stats = {served=0, change=0, kashOk=0, kashNo=0, loads=0, loadFail=0, utang=0, cleaned=0, restocked=0, picks=0,
@@ -1532,6 +1544,90 @@ task.spawn(function()
     end
 end)
 
+---------------------------------------------------------------- Pabilee parcel delivery (rider + parcel prompts)
+-- The game hands a Pabilee order over in two ways: a "PabileeRiderNPC" standing outside (prompt "PabileeRiderPrompt"),
+-- and a "PabileeParcel" model in Plots.<plot>.PabileeParcels (prompt "PabileeParcelPrompt"). Both are owner-only.
+stats.parcels = 0
+X.parcelNext, X.parcelTry, X.parcelBan = 0, {}, {}
+
+local function parcelPrompts()
+    local out = {}
+    for _, c in ipairs(workspace:GetChildren()) do
+        if c.Name == "PabileeRiderNPC" and c:GetAttribute("OwnerUserId") == lp.UserId and c:GetAttribute("Received") ~= true then
+            local pr = c:FindFirstChild("PabileeRiderPrompt", true)
+            if pr and pr:IsA("ProximityPrompt") and pr.Enabled and promptPos(pr) then out[#out+1] = pr end
+        elseif c.Name == "PabileeParcel" and c:GetAttribute("OwnerUserId") == lp.UserId then
+            local pr = c:FindFirstChild("PabileeParcelPrompt", true)
+            if pr and pr:IsA("ProximityPrompt") and pr.Enabled and promptPos(pr) then out[#out+1] = pr end
+        end
+    end
+    local plots = workspace:FindFirstChild("Plots")
+    for _, pl in ipairs(plots and plots:GetChildren() or {}) do
+        local f = pl:FindFirstChild("PabileeParcels")
+        if f then
+            for _, m in ipairs(f:GetChildren()) do
+                if m.Name == "PabileeParcel" and m:GetAttribute("OwnerUserId") == lp.UserId then
+                    local pr = m:FindFirstChild("PabileeParcelPrompt", true)
+                    if pr and pr:IsA("ProximityPrompt") and pr.Enabled and promptPos(pr) then out[#out+1] = pr end
+                end
+            end
+        end
+    end
+    return out
+end
+
+X.parcelScanT, X.parcelHas = 0, false
+local function hasParcel()
+    if not S.Parcel or tick() < X.parcelNext then return false end
+    if tick() - X.parcelScanT < 0.5 then return X.parcelHas end
+    X.parcelScanT, X.parcelHas = tick(), false
+    for _, pr in ipairs(parcelPrompts()) do
+        if not (X.parcelBan[pr] and tick() < X.parcelBan[pr]) then X.parcelHas = true break end
+    end
+    return X.parcelHas
+end
+
+local function parcelPass()
+    X.parcelNext = tick() + 1
+    local did = false
+    for _, pr in ipairs(parcelPrompts()) do
+        if not alive or not S.Parcel then break end
+        if not (X.parcelBan[pr] and tick() < X.parcelBan[pr]) then
+            local owner = pr:FindFirstAncestorWhichIsA("Model")
+            local pos = promptPos(pr)
+            local hrp = myHRP()
+            if not (pos and hrp) then break end
+            local maxd = pr.MaxActivationDistance or 10
+            if (hrp.Position - pos).Magnitude > math.max(4, maxd - 4) then
+                stream(pos)
+                standAt(hrp, pos)
+                task.wait(0.15)
+                settle()
+            end
+            pcall(function() pr.HoldDuration = 0 end)
+            X.parcelTry[pr] = (X.parcelTry[pr] or 0) + 1
+            fireproximityprompt(pr)
+            local t = tick()
+            while alive and pr.Parent and pr.Enabled and (not owner or owner.Parent) and owner and owner:GetAttribute("Received") ~= true and tick() - t < 1.2 do
+                task.wait(0.05)
+            end
+            local gone = not pr.Parent or not pr.Enabled or (owner and (not owner.Parent or owner:GetAttribute("Received") == true))
+            if gone then
+                stats.parcels = stats.parcels + 1
+                X.parcelTry[pr] = nil
+                did = true
+                dbg("Claimed a parcel delivery:", tostring(owner and owner.Name))
+                task.wait(0.4)
+            elseif X.parcelTry[pr] >= 4 then
+                X.parcelBan[pr] = tick() + 20
+                X.parcelTry[pr] = nil
+                dbg("Parcel prompt did not respond, retrying in 20s")
+            end
+        end
+    end
+    return did
+end
+
 ---------------------------------------------------------------- scheduler
 task.spawn(function()
     local lastHomeFix, lastStream = 0, 0
@@ -1552,6 +1648,7 @@ task.spawn(function()
             end
             if moveBusy then return end
             if S.Pickup and hasPickup() then withMove(pickupPass) return end
+            if hasParcel() then withMove(parcelPass) return end
             if S.Thief and tick() >= X.thiefNext then
                 if #thiefList() > 0 then
                     withMove(thiefPass)
@@ -1853,110 +1950,130 @@ task.spawn(function()
     end
 end)
 
----------------------------------------------------------------- UI
-local Win = Rayfield:CreateWindow({Name="Sari-Sari Auto v3.5", LoadingTitle="Sari-Sari Auto v3.1", ConfigurationSaving={Enabled=false}})
-local T = Win:CreateTab("Main")
-local function tog(name, key)
-    T:CreateToggle({Name=name, CurrentValue=S[key], Callback=function(v) S[key]=v applyUI() end})
-end
-tog("Auto Grab (skips out-of-stock)", "Grab")
-tog("Auto Register + Exact Change", "Checkout")
-tog("Stay at the register (live position)", "Stay")
-tog("Stand ON TOP of the register", "StandTop")
-tog("Auto Open store 24/7", "AutoOpen")
-tog("Auto Catch Thief (Tsinelas strike)", "Thief")
-tog("Auto Donate to Beggar", "Beggar")
-tog("Auto Collect Utang (when debtor is at counter)", "UtangCollect")
-tog("Auto Redeem Codes (at start)", "Codes")
-tog("Auto REBIRTH when ready (RESETS your store!)", "Rebirth")
-tog("Auto KashG (accept real / decline fake)", "KashG")
-tog("Auto Accept Utang", "Utang")
-tog("Auto E-Load (no phone UI)", "Load")
-tog("Auto Clean Dust / Leaves", "Clean")
-tog("Auto Restock shelves from backpack", "Restock")
-tog("Take boxes from racks when shelves run low", "Racks")
-tog("Auto Throw Away empty boxes", "Trash")
-tog("Auto Pick Up shop deliveries (fast)", "Pickup")
-tog("Smart Buy (shop computer)", "Buy")
-tog("Buy: customer-wanted / empty items first", "NeedsFirst")
-tog("Auto Pay Electric Bill", "Bill")
-tog("Auto Continue (day summary)", "Continue")
-tog("Auto Claim Daily Tasks", "Tasks")
-tog("Auto Wake Sleeping Workers (Tsinelas)", "Slap")
-tog("Anti-AFK", "AntiAFK")
-tog("Auto Unstick (Climbing freeze)", "Unstick")
-tog("Hide game popups (register / KashG / Utang)", "HideUI")
-tog("Checkout even if an item is out of stock", "SkipOut")
-T:CreateDropdown({Name="Buy priority", Options=BUY_MODES, CurrentOption={S.BuyMode}, MultipleOptions=false,
-    Callback=function(o)
-        local v = typeof(o) == "table" and o[1] or o
-        if typeof(v) == "string" then S.BuyMode = v nextBuyAt = 0 end
-    end})
-T:CreateDropdown({Name="Beggar donation (P)", Options={"1","5","10","20","50","100","500","1000"}, CurrentOption={tostring(S.BeggarAmt)}, MultipleOptions=false,
-    Callback=function(o)
-        local v = tonumber(typeof(o) == "table" and o[1] or o)
-        if v then S.BeggarAmt = v end
-    end})
-T:CreateSlider({Name="Buy when a shelf is at or below (%)", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.BuyBelow, Callback=function(v) S.BuyBelow=v nextBuyAt=0 end})
-T:CreateSlider({Name="Extra buffer boxes when cash is high", Range={0,3}, Increment=1, CurrentValue=S.Buffer, Callback=function(v) S.Buffer=v end})
-T:CreateInput({Name="Redeem a code now", PlaceholderText="type a code", RemoveTextAfterFocusLost=true,
-    Callback=function(t) if t and #t > 0 then task.spawn(redeem, t, true) end end})
-T:CreateButton({Name="Redeem all codes now", Callback=function() task.spawn(redeemAll, true) end})
-T:CreateButton({Name="Set stand spot here (relative to register)", Callback=function() setHome() end})
-T:CreateButton({Name="Go to register now", Callback=function() withMove(function() goHome(true) settle() end) end})
-T:CreateButton({Name="Buy now", Callback=function() nextBuyAt = 0 end})
-T:CreateSlider({Name="Keep this much cash when buying (P)", Range={0,10000}, Increment=250, CurrentValue=S.Reserve, Callback=function(v) S.Reserve=v end})
-T:CreateSlider({Name="Spend this % of spare cash per order (non-Smart)", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.BuyPct, Callback=function(v) S.BuyPct=v end})
-T:CreateSlider({Name="Max different items per order", Range={1,12}, Increment=1, CurrentValue=S.MaxItems, Callback=function(v) S.MaxItems=v end})
-T:CreateSlider({Name="Max boxes per item", Range={1,10}, Increment=1, CurrentValue=S.MaxBoxes, Callback=function(v) S.MaxBoxes=v end})
-T:CreateSlider({Name="Refill shelf when below (%)", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.Pct, Callback=function(v) S.Pct=v end})
-T:CreateSlider({Name="Fetch rack boxes when shelf below (%)", Range={10,100}, Increment=5, Suffix="%", CurrentValue=S.RackPct, Callback=function(v) S.RackPct=v end})
-T:CreateSlider({Name="Far-shelf restock trip every (seconds)", Range={1,30}, Increment=1, CurrentValue=S.TripEvery, Callback=function(v) S.TripEvery=v end})
-T:CreateSlider({Name="Reach: move only if farther than (studs)", Range={8,36}, Increment=1, CurrentValue=S.Reach, Callback=function(v) S.Reach=v end})
-T:CreateSlider({Name="Register radius (studs before returning)", Range={3,30}, Increment=1, CurrentValue=S.HomeRadius, Callback=function(v) S.HomeRadius=v end})
-T:CreateSlider({Name="Customer waits for restock (seconds)", Range={0,20}, Increment=1, CurrentValue=S.WaitStock, Callback=function(v) S.WaitStock=v end})
-T:CreateSlider({Name="Action Delay", Range={0.03,1}, Increment=0.01, CurrentValue=S.Delay, Callback=function(v) S.Delay=v end})
-local lbl1 = T:CreateLabel("Starting...")
-local lbl2 = T:CreateLabel("")
-local lbl3 = T:CreateLabel("")
-local lbl4 = T:CreateLabel("")
-local lbl5 = T:CreateLabel("")
+---------------------------------------------------------------- UI (Speed Hub)
+do
+    local FuncsV3 = UI.Funcs
+    FuncsV3:SetTable({})
+    local uiReady = false
 
-task.spawn(function()
-    while alive do
-        pcall(function()
-            lbl1:Set(string.format("Served %d | Picks %d | Change P%d | KashG +%d/-%d | Load %d (fail %d) | Utang %d",
-                stats.served, stats.picks, stats.change, stats.kashOk, stats.kashNo, stats.loads, stats.loadFail, stats.utang))
-            lbl2:Set(string.format("Restocked %d | Racked %d | Bought %d | Picked up %d | Trashed %d | Cleaned %d | Tasks %d | Bills %d | Days %d | Woke %d | Thieves %d | Opened %d",
-                stats.restocked, stats.racked, stats.bought, stats.picked, stats.trashed, stats.cleaned, stats.claimed, stats.bills, stats.continued, stats.slapped, stats.caught, stats.opened))
-            local plot = myPlot()
-            local empty, wantedN = 0, 0
-            if plot then
-                for _, m in ipairs(shelves(plot)) do
-                    if (m:GetAttribute("ProductId") or "") ~= "" and (m:GetAttribute("Stock") or 0) <= 0 then empty = empty + 1 end
-                end
+    local execName = "Unknown"
+    pcall(function() if identifyexecutor then execName = tostring((identifyexecutor())) end end)
+
+    local Library = UI.Lib:CreateWindow({
+        ["Tab Width"] = 160,
+        ["Description"] = "",
+        ["Title"] = "Run A Sari-Sari Store | Version: 1.0.0 | " .. execName
+    })
+    -- remember the GUIs the library created so SSAF_STOP can remove them
+    for _, g in ipairs(UI.root:GetChildren()) do
+        if not UI.before[g] then UI.guis[#UI.guis+1] = g end
+    end
+
+    local MainTab     = Library:CreateTab({["Name"] = "Main",     ["Icon"] = "rbxassetid://10723407389"})
+    local SettingsTab = Library:CreateTab({["Name"] = "Settings", ["Icon"] = "rbxassetid://10734950309"})
+
+    -- toggles start with the auto configuration (see the S table); the user can switch any of them off
+    local function tog(sec, name, content, key)
+        FuncsV3:Toggle(sec, name, content, S[key] and true or false, function(v)
+            S[key] = v
+            if uiReady then applyUI() end
+        end)
+    end
+
+    -- Slider (no FuncsV3 wrapper; use the library directly)
+    local function slider(sec, name, content, min, max, inc, key, after)
+        sec:AddSlider({
+            Title = name, Content = content, Increment = inc, Min = min, Max = max, Default = S[key],
+            Callback = function(v)
+                S[key] = v
+                if uiReady and after then after() end
             end
-            for _, t in pairs(wanted) do if tick() - t < 60 then wantedN = wantedN + 1 end end
-            local hrp = myHRP()
-            local hd = (hrp and HOME) and math.floor((hrp.Position - HOME.Position).Magnitude) or -1
-            lbl3:Set(string.format("Empty shelves %d | Wanted %d | Teleports %d | Returns %d | From register %d studs | Boxes %d | Store %s",
-                empty, wantedN, stats.hops, stats.homes, hd, #collectBoxes(), tostring(plot and plot:GetAttribute("StoreOpen"))))
-        end)
-        task.wait(1)
+        })
     end
-end)
 
-applyUI()
-task.spawn(function()
-    while alive do
-        pcall(function()
-            lbl4:Set(string.format("Utang collected %d (owed to you P%d) | Codes redeemed %d | Rebirths %d | Beggars %d",
-                stats.collected, X.utangTotal or 0, stats.codesOk, stats.rebirths, stats.donated))
-            lbl5:Set(X.rbText or "Rebirth: checking...")
+    ------------------------------------------------------------ MAIN > Store
+    local Store = MainTab:AddSection("Store", true)
+    tog(Store, "Auto Grab", "Grabs customer items and skips out-of-stock ones", "Grab")
+    tog(Store, "Auto Register", "Rings up customers with exact change", "Checkout")
+    tog(Store, "Stay at Register", "Stay at the register (live position)", "Stay")
+    tog(Store, "Auto Open Store 24/7", "Keeps the store open all the time", "AutoOpen")
+    tog(Store, "Auto Catch Thief", "Tsinelas strike on thieves", "Thief")
+    tog(Store, "Auto Donate to Beggar", "Donates the amount chosen below", "Beggar")
+    FuncsV3:Dropdown(Store, "Beggar Donation (P)", "Amount donated to the beggar", false,
+        {"1","5","10","20","50","100","500","1000"}, {tostring(S.BeggarAmt)}, function(o)
+            local v = tonumber(typeof(o) == "table" and o[1] or o)
+            if v then S.BeggarAmt = v end
         end)
-        task.wait(2)
-    end
-end)
+    tog(Store, "Auto Collect Utang", "Collects when the debtor is at the counter", "UtangCollect")
+    tog(Store, "Auto KashG", "Accept real / decline fake", "KashG")
+    tog(Store, "Auto Accept Utang", "Accepts utang requests", "Utang")
+    tog(Store, "Auto E-Load", "Handles E-Load with no phone UI", "Load")
+    tog(Store, "Checkout When Out of Stock", "Checkout even if an item is out of stock", "SkipOut")
+    tog(Store, "Auto Clean", "Cleans dust / leaves", "Clean")
+    tog(Store, "Auto Restock", "Restocks shelves from your backpack", "Restock")
+    tog(Store, "Take Boxes From Racks", "Takes boxes from racks when shelves run low", "Racks")
+    tog(Store, "Auto Throw Away Boxes", "Throws away empty boxes", "Trash")
+    tog(Store, "Auto Pick Up Deliveries", "Picks up shop deliveries (fast)", "Pickup")
+    tog(Store, "Auto Claim Parcel Delivery", "Claims your Pabilee parcel from the rider / drop-off zone", "Parcel")
+    tog(Store, "Auto Pay Electric Bill", "Pays the electric bill", "Bill")
+    tog(Store, "Auto Continue", "Continues past the day summary", "Continue")
+    tog(Store, "Auto Claim Daily Tasks", "Claims finished daily tasks", "Tasks")
+    tog(Store, "Auto Wake Workers", "Wakes sleeping workers (Tsinelas)", "Slap")
+    tog(Store, "Auto REBIRTH", "Rebirths when ready. WARNING: this RESETS your store!", "Rebirth")
+
+    ------------------------------------------------------------ MAIN > Restock
+    local Restock = MainTab:AddSection("Restock", true)
+    slider(Restock, "Refill Shelf Below %", "Refill a shelf when it falls below this percent", 10, 100, 5, "Pct")
+    slider(Restock, "Rack Fetch Below %", "Fetch rack boxes when a shelf is below this percent", 10, 100, 5, "RackPct")
+    slider(Restock, "Far Restock Every (s)", "Far-shelf restock trip interval in seconds", 1, 30, 1, "TripEvery")
+    slider(Restock, "Reach (studs)", "Move only if the target is farther than this", 8, 36, 1, "Reach")
+    slider(Restock, "Register Radius", "Studs from the register before returning to it", 3, 30, 1, "HomeRadius")
+    slider(Restock, "Customer Wait (s)", "Seconds a customer waits for restock", 0, 20, 1, "WaitStock")
+    -- the library slider box only takes whole numbers, so the delay is in milliseconds (30 - 1000 = 0.03 - 1 s)
+    Restock:AddSlider({
+        Title = "Action Delay (ms)", Content = "Delay between actions, 30 to 1000 ms",
+        Increment = 10, Min = 30, Max = 1000, Default = math.floor(S.Delay * 1000 + 0.5),
+        Callback = function(v) S.Delay = v / 1000 end
+    })
+
+    ------------------------------------------------------------ MAIN > Shop
+    local Shop = MainTab:AddSection("Shop", true)
+    tog(Shop, "Smart Buy", "Orders from the shop computer", "Buy")
+    tog(Shop, "Customer-Wanted First", "Buy customer-wanted / empty items first", "NeedsFirst")
+
+    -- Dropdown arguments: Tab, Name, Content, Multi, Options, Default, Callback
+    FuncsV3:Dropdown(Shop, "Buy Priority", "How items are chosen when buying", false,
+        BUY_MODES, {S.BuyMode}, function(o)
+            local v = typeof(o) == "table" and o[1] or o
+            if typeof(v) == "string" then
+                S.BuyMode = v
+                if uiReady then nextBuyAt = 0 end
+            end
+        end)
+
+    FuncsV3:Button(Shop, "Buy Now", "Orders right away", function() nextBuyAt = 0 end)
+
+    slider(Shop, "Buy Below Shelf %", "Buy when a shelf is at or below this percent", 10, 100, 5, "BuyBelow", function() nextBuyAt = 0 end)
+    slider(Shop, "Extra Buffer Boxes", "Extra boxes to order when cash is high", 0, 3, 1, "Buffer")
+    slider(Shop, "Cash Reserve (P)", "Keep this much cash when buying", 0, 10000, 250, "Reserve")
+    slider(Shop, "Spend % Per Order", "Percent of spare cash spent per order (non-Smart modes)", 10, 100, 5, "BuyPct")
+    slider(Shop, "Max Items Per Order", "Max different items per order", 1, 12, 1, "MaxItems")
+    slider(Shop, "Max Boxes Per Item", "Max boxes of each item per order", 1, 10, 1, "MaxBoxes")
+
+    ------------------------------------------------------------ SETTINGS
+    local Utility = SettingsTab:AddSection("Utility", true)
+    tog(Utility, "Anti-AFK", "Prevents the idle kick", "AntiAFK")
+    tog(Utility, "Auto Unstick", "Fixes the Climbing freeze", "Unstick")
+    tog(Utility, "Hide Game Popups", "Hides register / KashG / Utang popups", "HideUI")
+
+    local Tools = SettingsTab:AddSection("Tools", true)
+    FuncsV3:Button(Tools, "Set Stand Spot Here", "Saves your position relative to the register", function() setHome() end)
+    FuncsV3:Button(Tools, "Go to Register Now", "Teleports you to the register", function() withMove(function() goHome(true) settle() end) end)
+
+    uiReady = true
+    applyUI()
+end
+
 task.spawn(function()
     while alive do
         for _ = 1, 20 do if not alive then break end task.wait(1) end
@@ -1979,6 +2096,6 @@ getgenv().SSAF_STOP = function()
     suppress(R.CheckoutData, "RegisterClient", false)
     suppress(R.UtangAsk, "UtangClient", false)
     for _, c in ipairs(idleOff) do pcall(function() c:Enable() end) end
-    pcall(function() Rayfield:Destroy() end)
+    for _, g in ipairs(UI.guis) do pcall(function() g:Destroy() end) end
 end
 print("[SSAF] v3.5 loaded")
